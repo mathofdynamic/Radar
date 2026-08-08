@@ -1,0 +1,4 @@
+TELEGRAM_BOT_TOKEN=replace-after-revoking-the-exposed-token
+RADAR_ADMIN_KEY=replace-with-a-long-random-admin-key
+RADAR_DASHBOARD_USERNAME=replace-with-dashboard-username
+RADAR_DASHBOARD_PASSWORD=replace-with-a-long-random-dashboard-password

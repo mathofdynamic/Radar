@@ -1,0 +1,17 @@
+node_modules/
+.wrangler/
+.dev.vars
+.env
+.env.*
+!.env.example
+worker-configuration.local.d.ts
+*.log
+*.sqlite
+*.sqlite3
+*.db
+*.session
+secrets.json
+.dashboard-credentials.local
+coverage/
+dist/
+*.cpuprofile

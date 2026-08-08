@@ -1,6 +1,6 @@
 # Radar Implementation Playbook
 
-This folder contains the implementation plan for Radar as a sequence of coding-agent prompts.
+This folder contains the implementation plan for Radar as a sequence of coding-agent prompts. For this repository, `Overview/Cloudflare-Free-Adaptation.md` is the controlling architecture decision: public Telegram polling replaces the VPS/Telethon collector.
 
 Run the phases **in order**. Each phase assumes the previous phase is complete and passing its acceptance criteria.
 
@@ -23,7 +23,9 @@ The coding agent must follow these rules throughout the project:
 - Inspect the current repository before changing files; preserve working patterns introduced by previous phases.
 - Do not implement future phases early unless a minimal interface/stub is required by the current phase.
 - Prefer simple, testable components over premature abstraction.
-- Keep Telegram-specific stateful logic isolated from Cloudflare serverless logic.
+- Keep Telegram public-page parsing isolated from the Cloudflare processing modules.
+- Do not reintroduce Telethon, a Telegram user session, or a VPS without an explicit architecture decision.
+- Do not add R2 for covers; the current architecture generates covers in memory, uses a deterministic SVG fallback, and uploads them directly to Telegram.
 - Keep secrets out of Git.
 - Use typed/validated contracts at service boundaries.
 - All writes that may be retried must be idempotent.

@@ -1,0 +1,129 @@
+import { runtimeConfig } from "../config";
+import { reserveAiCall } from "../db";
+import type { JsonObject } from "../types";
+
+interface AiTextResult {
+  response?: string;
+  result?: unknown;
+}
+
+export async function generateEmbedding(env: Env, text: string): Promise<number[] | null> {
+  const config = runtimeConfig(env);
+  const allowed = await reserveAiCall(env.DB, "embedding", config.maxEmbeddingsPerDay, 12, config.aiDailyNeuronBudget);
+  if (!allowed) return null;
+  try {
+    const result = await env.AI.run(config.embeddingModel, { text: [text.slice(0, 4_000)] });
+    if (isNumberArray(result)) return result;
+    if (isEmbeddingResult(result)) return result.data[0] ?? null;
+    return null;
+  } catch (error) {
+    console.error(JSON.stringify({ event: "ai_embedding_failed", error: error instanceof Error ? error.message : "unknown" }));
+    return null;
+  }
+}
+
+export async function generateStructuredText(env: Env, prompt: string, stage: "stage1" | "stage2"): Promise<JsonObject | null> {
+  const config = runtimeConfig(env);
+  const maxCalls = stage === "stage1" ? config.maxStage1CallsPerDay : config.maxStage2CallsPerDay;
+  const allowed = await reserveAiCall(env.DB, stage, maxCalls, stage === "stage1" ? 40 : 120, config.aiDailyNeuronBudget);
+  if (!allowed) return null;
+  try {
+    const result = await env.AI.run(config.textModel, {
+      messages: [
+        { role: "system", content: "Return only valid JSON. Do not invent facts." },
+        { role: "user", content: prompt.slice(0, 8_000) }
+      ],
+      max_tokens: 600
+    });
+    const text = extractText(result);
+    if (!text) return null;
+    const parsed: unknown = JSON.parse(text);
+    return isJsonObject(parsed) ? parsed : null;
+  } catch (error) {
+    console.error(JSON.stringify({ event: "ai_structured_text_failed", stage, error: error instanceof Error ? error.message : "unknown" }));
+    return null;
+  }
+}
+
+export async function generateImage(env: Env, prompt: string): Promise<ArrayBuffer | null> {
+  const config = runtimeConfig(env);
+  const allowed = await reserveAiCall(env.DB, "cover", config.maxCoversPerDay, 500, config.aiDailyNeuronBudget);
+  if (!allowed) {
+    console.info(JSON.stringify({ event: "ai_image_skipped", reason: "daily_budget_exhausted", model: config.imageModel }));
+    return null;
+  }
+  try {
+    const form = new FormData();
+    form.append("prompt", prompt.slice(0, 1_000));
+    form.append("width", "640");
+    form.append("height", "360");
+    const multipartResponse = new Response(form);
+    const contentType = multipartResponse.headers.get("content-type");
+    if (!multipartResponse.body || !contentType) return null;
+    const result = await env.AI.run(config.imageModel, {
+      multipart: {
+        body: multipartResponse.body,
+        contentType
+      }
+    });
+    if (isJsonObject(result) && typeof result.image === "string") {
+      return decodeBase64Image(result.image);
+    }
+    if (result instanceof ArrayBuffer) return isTelegramImage(result) ? result : null;
+    if (result instanceof Uint8Array) {
+      const copy = new Uint8Array(result.byteLength);
+      copy.set(result);
+      return isTelegramImage(copy.buffer) ? copy.buffer : null;
+    }
+    if (isReadableStream(result)) {
+      const bytes = await new Response(result).arrayBuffer();
+      return isTelegramImage(bytes) ? bytes : null;
+    }
+    console.error(JSON.stringify({ event: "ai_image_invalid", model: config.imageModel, reason: "unsupported_response" }));
+    return null;
+  } catch (error) {
+    console.error(JSON.stringify({ event: "ai_image_failed", error: error instanceof Error ? error.message : "unknown" }));
+    return null;
+  }
+}
+
+function extractText(value: unknown): string | null {
+  if (!isJsonObject(value)) return null;
+  if (typeof value.response === "string") return value.response;
+  if (typeof value.result === "string") return value.result;
+  if (isJsonObject(value.result) && typeof value.result.response === "string") return value.result.response;
+  return null;
+}
+
+function isJsonObject(value: unknown): value is JsonObject {
+  return typeof value === "object" && value !== null && !Array.isArray(value);
+}
+
+function isNumberArray(value: unknown): value is number[] {
+  return Array.isArray(value) && value.every((item) => typeof item === "number");
+}
+
+function isEmbeddingResult(value: unknown): value is { data: number[][] } {
+  return isJsonObject(value) && Array.isArray(value.data) && value.data.every((row) => isNumberArray(row));
+}
+
+function isReadableStream(value: unknown): value is ReadableStream<Uint8Array> {
+  return typeof value === "object" && value !== null && "getReader" in value && typeof value.getReader === "function";
+}
+
+function decodeBase64Image(value: string): ArrayBuffer | null {
+  const encoded = value.includes(",") ? value.slice(value.indexOf(",") + 1) : value;
+  try {
+    const binary = atob(encoded.replace(/\s+/gu, ""));
+    const bytes = new Uint8Array(binary.length);
+    for (let index = 0; index < binary.length; index += 1) bytes[index] = binary.charCodeAt(index);
+    return isTelegramImage(bytes.buffer) ? bytes.buffer : null;
+  } catch {
+    return null;
+  }
+}
+
+function isTelegramImage(bytes: ArrayBuffer): boolean {
+  const header = new Uint8Array(bytes, 0, Math.min(bytes.byteLength, 12));
+  return header.length >= 8 && header[0] === 137 && header[1] === 80 && header[2] === 78 && header[3] === 71 && header[4] === 13 && header[5] === 10 && header[6] === 26 && header[7] === 10;
+}
