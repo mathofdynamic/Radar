@@ -15,7 +15,19 @@ import { createCover } from "./publisher/covers";
 import { editPublishedStory, publishStory, verifyTelegramDestination } from "./publisher/telegram";
 import { isAdminRequest, isOperatorRequest, healthResponse, opsSummary } from "./ops";
 import type { PublishJob, SourceSeed, TelegramWebPollEnvelope, VerificationStatus } from "./types";
-import type { EditorialJob, PollCycleJob, PublishQueueJob, QueueJob, RawIngestJob, RawPostJob } from "./queue";
+import type {
+  AnalysisBatchJob,
+  EditorialBatchJob,
+  EditorialJob,
+  PollCycleJob,
+  PublishQueueJob,
+  QueueJob,
+  RawIngestJob,
+  RawPostJob
+} from "./queue";
+
+const ANALYSIS_ITEMS_PER_JOB = 2;
+const EDITORIAL_ITEMS_PER_JOB = 2;
 
 interface PublishedEventState {
   publish_key: string;
@@ -73,8 +85,6 @@ export default {
     }
   },
 
-  // Free-plan Cron invocations have only 10 ms CPU. Keep this handler intentionally
-  // tiny: one Queue write and no D1 queries, Telegram fetches, parsing, hashing or recovery.
   async scheduled(controller: ScheduledController, env: Env): Promise<void> {
     await env.POLL_QUEUE.send({
       kind: "poll_cycle",
@@ -101,7 +111,7 @@ export default {
             console.error(JSON.stringify({ event: "publish_failure_record_failed", error: normalizeErrorMessage(recordError) }));
           }
         }
-        await incrementCounter(env.DB, "queue_failures");
+        await safeIncrementCounter(env.DB, "queue_failures");
         message.retry();
       }
     }
@@ -111,7 +121,9 @@ export default {
 async function dispatchQueueJob(queue: string, body: QueueJob, env: Env): Promise<void> {
   if (queue === "radar-poll" && body.kind === "poll_cycle") return processPollCycle(env, body);
   if (queue === "radar-raw-ingest" && body.kind === "raw_ingest") return processRawIngest(env, body);
+  if (queue === "radar-event-analysis" && body.kind === "analysis_batch") return processAnalysisBatch(env, body);
   if (queue === "radar-event-analysis" && body.kind === "raw_post") return processAnalysis(env, body);
+  if (queue === "radar-editorial" && body.kind === "editorial_batch") return processEditorialBatch(env, body);
   if (queue === "radar-editorial" && body.kind === "editorial_candidate") return processEditorial(env, body);
   if (queue === "radar-publish" && body.kind === "publish") return processPublish(env, body);
   throw new Error(`queue_job_mismatch:${queue}:${body.kind}`);
@@ -121,7 +133,7 @@ async function processPollCycle(env: Env, job: PollCycleJob): Promise<void> {
   await seedSourcesIfEmpty(env);
 
   const scheduledAt = new Date(job.scheduledAt);
-  if (!Number.isNaN(scheduledAt.getTime()) && scheduledAt.getUTCMinutes() % 15 === 0) {
+  if (!Number.isNaN(scheduledAt.getTime()) && scheduledAt.getUTCMinutes() % 30 === 0) {
     await recoverStalePublishJobs(env);
   }
 
@@ -129,52 +141,77 @@ async function processPollCycle(env: Env, job: PollCycleJob): Promise<void> {
   await incrementCounter(env.DB, "poll_cycles");
   if (envelopes.length > 0) await incrementCounter(env.DB, "poll_envelopes_observed", envelopes.length);
 
-  // Happy path stays in this Queue consumer. This avoids paying three Queue
-  // deliveries for every raw post on the Free plan. The old stage queues remain
-  // available as narrow fallbacks if a synchronous stage fails after persistence.
+  const rawPostIds: number[] = [];
   for (const envelope of envelopes) {
-    let rawPostId: number;
     try {
-      rawPostId = await ingestEnvelope(env, envelope, { enqueueAnalysis: false });
+      const rawPostId = await ingestEnvelope(env, envelope, { enqueueAnalysis: false });
+      rawPostIds.push(rawPostId);
     } catch (error) {
       const errorMessage = normalizeErrorMessage(error);
-      console.error(JSON.stringify({ event: "poll_sync_ingest_failed", source_id: envelope.sourceId, message_id: envelope.externalMessageId, error: errorMessage }));
-      await incrementCounter(env.DB, "poll_sync_ingest_failures");
+      console.error(JSON.stringify({ event: "poll_ingest_failed", source_id: envelope.sourceId, message_id: envelope.externalMessageId, error: errorMessage }));
+      await safeIncrementCounter(env.DB, "poll_ingest_failures");
       await env.RAW_INGEST_QUEUE.send({ kind: "raw_ingest", envelope } satisfies RawIngestJob);
-      continue;
-    }
-
-    let candidate;
-    try {
-      candidate = await analyzeRawPost(env, rawPostId);
-    } catch (error) {
-      const errorMessage = normalizeErrorMessage(error);
-      console.error(JSON.stringify({ event: "poll_sync_analysis_failed", raw_post_id: rawPostId, error: errorMessage }));
-      await incrementCounter(env.DB, "poll_sync_analysis_failures");
-      await env.EVENT_ANALYSIS_QUEUE.send({ kind: "raw_post", rawPostId } satisfies RawPostJob);
-      continue;
-    }
-
-    if (!candidate) continue;
-    try {
-      await processEditorial(env, { kind: "editorial_candidate", candidate });
-    } catch (error) {
-      const errorMessage = normalizeErrorMessage(error);
-      console.error(JSON.stringify({ event: "poll_sync_editorial_failed", event_id: candidate.eventId, event_version: candidate.eventVersion, error: errorMessage }));
-      await incrementCounter(env.DB, "poll_sync_editorial_failures");
-      await env.EDITORIAL_QUEUE.send({ kind: "editorial_candidate", candidate } satisfies EditorialJob);
     }
   }
+
+  let queuedBatches = 0;
+  for (const rawPostIdsBatch of chunk(uniqueNumbers(rawPostIds), ANALYSIS_ITEMS_PER_JOB)) {
+    await env.EVENT_ANALYSIS_QUEUE.send({ kind: "analysis_batch", rawPostIds: rawPostIdsBatch } satisfies AnalysisBatchJob);
+    queuedBatches += 1;
+  }
+  if (queuedBatches > 0) await incrementCounter(env.DB, "analysis_batches_queued", queuedBatches);
 }
 
 async function processRawIngest(env: Env, job: RawIngestJob): Promise<void> {
   const envelope = telegramWebPollEnvelopeSchema.parse(job.envelope) as TelegramWebPollEnvelope;
-  await ingestEnvelope(env, envelope);
+  const rawPostId = await ingestEnvelope(env, envelope, { enqueueAnalysis: false });
+  await env.EVENT_ANALYSIS_QUEUE.send({ kind: "analysis_batch", rawPostIds: [rawPostId] } satisfies AnalysisBatchJob);
 }
 
 async function processAnalysis(env: Env, job: RawPostJob): Promise<void> {
   const candidate = await analyzeRawPost(env, job.rawPostId);
-  if (candidate) await env.EDITORIAL_QUEUE.send({ kind: "editorial_candidate", candidate } satisfies EditorialJob);
+  if (candidate) await env.EDITORIAL_QUEUE.send({ kind: "editorial_batch", candidates: [candidate] } satisfies EditorialBatchJob);
+}
+
+async function processAnalysisBatch(env: Env, job: AnalysisBatchJob): Promise<void> {
+  const current = uniqueNumbers(job.rawPostIds).slice(0, ANALYSIS_ITEMS_PER_JOB);
+  const remaining = uniqueNumbers(job.rawPostIds).slice(ANALYSIS_ITEMS_PER_JOB);
+  const candidates = [];
+
+  for (const rawPostId of current) {
+    try {
+      const candidate = await analyzeRawPost(env, rawPostId);
+      if (candidate) candidates.push(candidate);
+    } catch (error) {
+      console.error(JSON.stringify({ event: "analysis_batch_item_failed", raw_post_id: rawPostId, error: normalizeErrorMessage(error) }));
+      await safeIncrementCounter(env.DB, "analysis_item_failures");
+      await env.EVENT_ANALYSIS_QUEUE.send({ kind: "raw_post", rawPostId } satisfies RawPostJob);
+    }
+  }
+
+  if (candidates.length > 0) {
+    await env.EDITORIAL_QUEUE.send({ kind: "editorial_batch", candidates } satisfies EditorialBatchJob);
+  }
+  if (remaining.length > 0) {
+    await env.EVENT_ANALYSIS_QUEUE.send({ kind: "analysis_batch", rawPostIds: remaining } satisfies AnalysisBatchJob);
+  }
+}
+
+async function processEditorialBatch(env: Env, job: EditorialBatchJob): Promise<void> {
+  const current = job.candidates.slice(0, EDITORIAL_ITEMS_PER_JOB);
+  const remaining = job.candidates.slice(EDITORIAL_ITEMS_PER_JOB);
+  for (const candidate of current) {
+    try {
+      await processEditorial(env, { kind: "editorial_candidate", candidate });
+    } catch (error) {
+      console.error(JSON.stringify({ event: "editorial_batch_item_failed", event_id: candidate.eventId, event_version: candidate.eventVersion, error: normalizeErrorMessage(error) }));
+      await safeIncrementCounter(env.DB, "editorial_item_failures");
+      await env.EDITORIAL_QUEUE.send({ kind: "editorial_candidate", candidate } satisfies EditorialJob);
+    }
+  }
+  if (remaining.length > 0) {
+    await env.EDITORIAL_QUEUE.send({ kind: "editorial_batch", candidates: remaining } satisfies EditorialBatchJob);
+  }
 }
 
 async function processEditorial(env: Env, job: EditorialJob): Promise<void> {
@@ -435,6 +472,24 @@ function normalizeErrorMessage(error: unknown): string {
   return (error instanceof Error ? error.message : String(error || "unknown_error")).slice(0, 1_000);
 }
 
+async function safeIncrementCounter(db: D1Database, metric: string, amount = 1): Promise<void> {
+  try {
+    await incrementCounter(db, metric, amount);
+  } catch (error) {
+    console.warn(JSON.stringify({ event: "counter_increment_skipped", metric, error: normalizeErrorMessage(error) }));
+  }
+}
+
+function uniqueNumbers(values: number[]): number[] {
+  return [...new Set(values.filter((value) => Number.isSafeInteger(value) && value > 0))];
+}
+
+function chunk<T>(values: T[], size: number): T[][] {
+  const result: T[][] = [];
+  for (let index = 0; index < values.length; index += size) result.push(values.slice(index, index + size));
+  return result;
+}
+
 async function seedSourcesIfEmpty(env: Env): Promise<void> {
   const count = await env.DB.prepare("SELECT COUNT(*) AS count FROM sources").first<{ count: number }>();
   if ((count?.count ?? 0) === 0) await seedSources(env);
@@ -450,7 +505,7 @@ async function validateSources(env: Env): Promise<{ activated: string[]; inactiv
   const inactive: Array<{ source: string; reason: string }> = [];
   for (const source of rows.results) {
     try {
-      const response = await fetch(`https://t.me/s/${encodeURIComponent(source.telegram_username)}`, { headers: { accept: "text/html", "user-agent": "Radar/0.2 source-validator" } });
+      const response = await fetch(`https://t.me/s/${encodeURIComponent(source.telegram_username)}`, { headers: { accept: "text/html", "user-agent": "Radar/0.3 source-validator" } });
       if (!response.ok) throw new Error(`http_${response.status}`);
       const html = await readBoundedText(response, runtimeConfig(env).maxHtmlBytes);
       if (!html.includes("data-post=")) throw new Error("no_public_posts");
