@@ -25,6 +25,29 @@ function capture(source: string, pattern: RegExp): string | null {
   return match?.[1] ?? null;
 }
 
+function forwardedFrom(segment: string): string | null {
+  return capture(segment, /class="[^"]*tgme_widget_message_forwarded_from[^"]*"[^>]*href="https:\/\/t\.me\/([^\/?"#]+)[^"]*"/iu)
+    ?? capture(segment, /tgme_widget_message_forwarded_from[\s\S]{0,800}?href="https:\/\/t\.me\/([^\/?"#]+)[^"]*"/iu);
+}
+
+function citedSource(text: string): string | null {
+  const patterns: Array<[string, RegExp]> = [
+    ["reuters", /(?:رویترز|reuters)/iu],
+    ["ap", /(?:آسوشیتد\s*پرس|associated press|\bAP\b)/iu],
+    ["afp", /(?:فرانس\s*پرس|agence france-presse|\bAFP\b)/iu],
+    ["irna", /(?:خبرگزاری جمهوری اسلامی|\bایرنا\b|\bIRNA\b)/iu],
+    ["tasnim", /(?:خبرگزاری تسنیم|\bتسنیم\b|\bTasnim\b)/iu],
+    ["fars", /(?:خبرگزاری فارس|\bفارس\b|Fars News)/iu],
+    ["bbc_persian", /(?:بی[‌\s-]*بی[‌\s-]*سی فارسی|BBC Persian)/iu],
+    ["iran_international", /(?:ایران اینترنشنال|Iran International)/iu],
+    ["euronews", /(?:یورونیوز|Euronews)/iu],
+    ["alarabiya", /(?:العربیه|Al Arabiya)/iu]
+  ];
+  const attribution = /به\s+(?:نقل|گزارش)\s+از|منبع\s*[:：]|according to|reports?\s+(?:from|by)|via/iu.test(text);
+  if (!attribution) return null;
+  return patterns.find(([, pattern]) => pattern.test(text))?.[0] ?? null;
+}
+
 export async function parseTelegramPublicPage(html: string, sourceId: number, sourceKey: string, username: string): Promise<ParseResult> {
   const marker = /data-post="([^"]+\/\d+)"/gu;
   const markers = Array.from(html.matchAll(marker));
@@ -47,7 +70,7 @@ export async function parseTelegramPublicPage(html: string, sourceId: number, so
     const textHtml = capture(segment, /class="[^"]*tgme_widget_message_text[^"]*"[^>]*>([\s\S]*?)<\/div>/iu) ?? "";
     const text = decodeHtml(textHtml);
     const time = capture(segment, /<time[^>]*datetime="([^"]+)"/iu);
-    const editedAt = capture(segment, /<time[^>]*datetime="[^"]+"[^>]*>[^<]*<\/time>[\s\S]*?edited/iu) ? new Date().toISOString() : null;
+    const isEdited = /\bedited\b|ویرایش/iu.test(segment);
     const mediaType = segment.includes("tgme_widget_message_photo_wrap")
       ? "photo"
       : segment.includes("tgme_widget_message_video")
@@ -56,11 +79,16 @@ export async function parseTelegramPublicPage(html: string, sourceId: number, so
           ? "document"
           : null;
     const canonicalUrl = `https://t.me/${postKey}`;
+    const forwarded = forwardedFrom(segment);
+    const cited = citedSource(text);
     const metadata = {
       transport: "telegram_public_web",
       source_key: sourceKey,
       page_segment_length: segment.length,
-      has_media: mediaType !== null
+      has_media: mediaType !== null,
+      is_edited: isEdited,
+      ...(forwarded ? { forwarded_from: forwarded } : {}),
+      ...(cited ? { cited_source: cited } : {})
     };
     posts.push({
       sourceId,
@@ -69,7 +97,7 @@ export async function parseTelegramPublicPage(html: string, sourceId: number, so
       messageId,
       canonicalUrl,
       publishedAt: time ? new Date(time).toISOString() : null,
-      editedAt,
+      editedAt: isEdited ? new Date().toISOString() : null,
       text,
       mediaType,
       contentHash: await sha256Hex(`${canonicalUrl}\n${text}\n${mediaType ?? ""}`),
