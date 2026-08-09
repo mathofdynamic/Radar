@@ -9,10 +9,12 @@ interface EvidenceGroup {
 }
 
 export function originGroupFor(source: SourceRow, rawPost: RawPostRow, existingGroup?: string): string {
-  if (existingGroup) return existingGroup;
   const metadata = safeJson(rawPost.raw_metadata_json);
-  const citedSource = typeof metadata.cited_source === "string" ? metadata.cited_source : null;
-  if (citedSource) return `cited:${citedSource.toLowerCase()}`;
+  const forwardedFrom = typeof metadata.forwarded_from === "string" ? canonicalOrigin(metadata.forwarded_from) : null;
+  const citedSource = typeof metadata.cited_source === "string" ? canonicalOrigin(metadata.cited_source) : null;
+  if (forwardedFrom) return `origin:${forwardedFrom}`;
+  if (citedSource) return `origin:${citedSource}`;
+  if (existingGroup) return existingGroup;
   return source.is_wire_origin ? `origin:${source.source_key}` : `source:${source.id}`;
 }
 
@@ -21,7 +23,7 @@ export function classifyOrigin(source: SourceRow, rawPost: RawPostRow): string {
   if (metadata.forwarded_from) return "forward_repost";
   if (typeof metadata.cited_source === "string") return "wire_republish";
   if (source.is_wire_origin || source.role === "primary_source") return "original_reporting";
-  if (source.role === "aggregator") return "aggregation";
+  if (source.role === "aggregator" || source.role === "breaking_radar") return "aggregation";
   return "unknown";
 }
 
@@ -38,8 +40,10 @@ export function calculateVerification(
       supports: true
     };
     group.sourceIds.add(item.source.id);
-    group.credible = group.credible || item.source.trust_score >= 0.55 || item.source.priority_tier === "TIER_1";
-    group.supports = group.supports && !/تکذیب|رد شد|جعلی|denied|false|fake/iu.test(item.rawPost.normalized_text);
+    const sourceCredible = item.source.trust_score >= 0.55 || item.source.priority_tier === "TIER_1";
+    const evidenceCanConfirm = item.originType !== "aggregation" || item.source.priority_tier === "TIER_1";
+    group.credible = group.credible || (sourceCredible && evidenceCanConfirm);
+    group.supports = group.supports && !/تکذیب|رد\s+شد|جعلی|نادرست|denied|false|fake|not\s+true/iu.test(item.rawPost.normalized_text);
     groups.set(item.originGroup, group);
   }
   const groupList = Array.from(groups.values());
@@ -67,6 +71,33 @@ export async function persistVerification(db: D1Database, eventId: number, resul
     eventId
   ).run();
   await incrementCounter(db, `verification_${result.status.toLowerCase()}`);
+}
+
+function canonicalOrigin(value: string): string {
+  const normalized = value.trim().toLocaleLowerCase().replace(/^@/u, "").replace(/[\s_-]+/gu, "_");
+  const aliases: Record<string, string> = {
+    "رویترز": "reuters",
+    "reuters": "reuters",
+    "آسوشیتد_پرس": "ap",
+    "associated_press": "ap",
+    "ap": "ap",
+    "فرانس_پرس": "afp",
+    "afp": "afp",
+    "ایرنا": "irna",
+    "irna": "irna",
+    "irna_1313": "irna",
+    "تسنیم": "tasnim",
+    "tasnim": "tasnim",
+    "tasnimnews": "tasnim",
+    "فارس": "fars",
+    "fars": "fars",
+    "farsna": "fars",
+    "bbc_persian": "bbc_persian",
+    "bbcpersian": "bbc_persian",
+    "iran_international": "iran_international",
+    "iranintltv": "iran_international"
+  };
+  return aliases[normalized] ?? normalized.slice(0, 80);
 }
 
 function safeJson(value: string): Record<string, unknown> {
