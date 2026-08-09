@@ -10,26 +10,43 @@ The original plan used a persistent Telethon user account on a Linux VPS. This r
 Cloudflare Cron -> https://t.me/s/{username} -> D1/Queue -> intelligence pipeline
 ```
 
-The adapter does not promise real-time delivery, reliable deletes, full forward metadata, or numeric Telegram channel IDs. Stable internal source IDs and public message URLs are the authoritative identity available to the polling transport.
+The adapter does not promise real-time delivery, reliable deletes, complete forward metadata, or numeric Telegram channel IDs. Stable internal source IDs and public message URLs are the authoritative identity available to the polling transport.
 
 ## Storage decision
 
-R2 is intentionally not used. Covers are generated in Worker memory: Workers AI is used when the cover budget allows, and a deterministic branded SVG is used otherwise. The bytes are uploaded directly to Telegram with `sendPhoto`; D1 stores the event/version cover reference. AI-generated cover bytes are not archived, so a retry after an unpersisted Telegram failure may generate a new AI image.
+R2 is intentionally not used. Covers are generated in Worker memory: Workers AI is used when the cover budget allows, and a deterministic branded PNG is used otherwise. The bytes are uploaded directly to Telegram with `sendPhoto`; D1 stores the event/version cover reference. AI-generated cover bytes are not archived, so a retry after an unpersisted Telegram failure may generate a new AI image.
 
 ## Polling defaults
 
 - one scheduled invocation per minute;
-- at most two sources per invocation;
-- approximately 15-minute source cadence for 30 active sources;
+- up to six due sources per invocation by default;
+- base source interval of three minutes, with actual revisit time depending on the number of due sources and Worker execution;
 - bounded response body of 512 KiB;
 - failed pages mark the source degraded and never look like an empty page;
 - source cursors are stored in D1;
-- repeated messages are idempotent on `(source_id, telegram_message_id)`.
+- repeated messages are idempotent on `(source_id, telegram_message_id)`;
+- suspicious jumps between the previous message ID and the earliest currently visible public-page message increment `poll_gap_suspected` and are logged for operator review.
+
+Public-page polling still has a hard limitation: a sufficiently active channel can publish enough messages between successful polls that older unseen posts disappear from the current web preview. The V2 polling changes reduce this risk and make suspected gaps observable; they do not eliminate it. MTProto remains the stronger long-term ingestion transport if collection completeness becomes a requirement.
+
+## Intelligence V2
+
+The current pipeline uses Workers AI embeddings as an actual event-matching signal rather than only storing them in Vectorize. Vectorize nearest neighbors are combined with lexical overlap, entities, and temporal proximity when assigning reports to events.
+
+Near-duplicate reports are retained as evidence. A report may be marked as duplicate content while still being attached to the event, allowing independent confirmation logic to evaluate its origin instead of discarding it.
+
+The public Telegram parser also extracts available forward and citation hints. These hints, plus strong lexical-copy relationships, are used to group reports by likely origin so copied reports do not automatically inflate confirmation counts.
+
+Importance scoring intentionally uses conservative deterministic priors. Events that reach the editorial stage are then reviewed by a low-cost AI editor that can adjust the score and recommend `PUBLISH`, `MONITOR`, or `IGNORE`. Verification and publication safety gates still remain deterministic.
+
+Material changes to an already-published event can edit the existing Telegram caption instead of creating a second story. Verification changes, meaningful confirmation growth, and breaking-event developments are treated as material updates.
 
 ## Publishing identity
 
 The Radar destination is `https://t.me/RadarKhabarOnline` with chat ID `-1004496469105`. The bot token is a Worker secret and must be rotated if exposed. Publishing is gated by `PUBLISH_ENABLED` and the bot's channel administrator permission.
 
+`PUBLISH_ENABLED` is intentionally set to `false` on the Intelligence V2 branch. Re-enable it only after type generation, tests, deployment smoke checks, source validation, and observation of real event clustering/editorial decisions.
+
 ## AI and cost policy
 
-AI is optional at every stage. D1 stores the raw evidence even when an AI stage is skipped. Daily usage counters and configured stage caps stop new AI work when the free budget is exhausted. Deterministic clustering, scoring, story fallback, and branded SVG cover generation remain available without R2.
+AI is optional at every stage. D1 stores the raw evidence even when an AI stage is skipped. Daily usage counters and configured stage caps stop new AI work when the free budget is exhausted. Deterministic clustering fallbacks, scoring, story fallback, and branded PNG cover generation remain available without R2.
