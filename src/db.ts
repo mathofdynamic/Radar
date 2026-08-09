@@ -182,6 +182,15 @@ export async function countStoriesToday(db: D1Database): Promise<number> {
   return row?.count ?? 0;
 }
 
+export async function getSourcePostFingerprints(db: D1Database, sourceId: number, minMessageId: number, maxMessageId: number): Promise<Map<number, string>> {
+  const result = await db.prepare(
+    `SELECT telegram_message_id, content_hash
+       FROM raw_posts
+      WHERE source_id = ? AND telegram_message_id BETWEEN ? AND ?`
+  ).bind(sourceId, minMessageId, maxMessageId).all<{ telegram_message_id: number; content_hash: string }>();
+  return new Map(result.results.map((row) => [row.telegram_message_id, row.content_hash]));
+}
+
 export async function recordSourcePostFingerprint(db: D1Database, post: PolledPost): Promise<boolean> {
   const row = await db.prepare("SELECT content_hash FROM raw_posts WHERE source_id = ? AND telegram_message_id = ?")
     .bind(post.sourceId, post.messageId).first<{ content_hash: string }>();
