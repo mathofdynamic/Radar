@@ -10,11 +10,11 @@
     "RADAR_DESTINATION_CHAT_ID": "-1004496469105",
     "RADAR_DESTINATION_URL": "https://t.me/RadarKhabarOnline",
     "PUBLISH_ENABLED": "false",
-    "POLL_BATCH_SIZE": "8",
+    "POLL_BATCH_SIZE": "3",
     "POLL_INTERVAL_SECONDS": "180",
     "MAX_HTML_BYTES": "524288",
     "AI_EMBEDDING_MODEL": "@cf/baai/bge-m3",
-    "AI_TEXT_MODEL": "@cf/meta/llama-3.2-3b-instruct",
+    "AI_TEXT_MODEL": "@cf/meta/llama-3.1-8b-instruct-fast",
     "AI_IMAGE_MODEL": "@cf/black-forest-labs/flux-2-klein-4b",
     "AI_DAILY_NEURON_BUDGET": "8000",
     "MAX_EMBEDDINGS_PER_DAY": "1500",
@@ -52,10 +52,37 @@
         "dead_letter_queue": "radar-dead-letter",
         "max_concurrency": 1
       },
-      { "queue": "radar-raw-ingest", "max_batch_size": 10, "max_batch_timeout": 10 },
-      { "queue": "radar-event-analysis", "max_batch_size": 5, "max_batch_timeout": 10 },
-      { "queue": "radar-editorial", "max_batch_size": 5, "max_batch_timeout": 10 },
-      { "queue": "radar-publish", "max_batch_size": 3, "max_batch_timeout": 10 }
+      {
+        "queue": "radar-raw-ingest",
+        "max_batch_size": 1,
+        "max_batch_timeout": 1,
+        "max_retries": 3,
+        "dead_letter_queue": "radar-dead-letter"
+      },
+      {
+        "queue": "radar-event-analysis",
+        "max_batch_size": 1,
+        "max_batch_timeout": 1,
+        "max_retries": 3,
+        "dead_letter_queue": "radar-dead-letter",
+        "max_concurrency": 2
+      },
+      {
+        "queue": "radar-editorial",
+        "max_batch_size": 1,
+        "max_batch_timeout": 1,
+        "max_retries": 3,
+        "dead_letter_queue": "radar-dead-letter",
+        "max_concurrency": 2
+      },
+      {
+        "queue": "radar-publish",
+        "max_batch_size": 1,
+        "max_batch_timeout": 1,
+        "max_retries": 3,
+        "dead_letter_queue": "radar-dead-letter",
+        "max_concurrency": 1
+      }
     ]
   },
   "ai": { "binding": "AI" },
@@ -63,7 +90,7 @@
     { "binding": "EVENT_INDEX", "index_name": "radar-events" }
   ],
   "triggers": {
-    "crons": ["* * * * *"]
+    "crons": ["*/2 * * * *"]
   },
   "observability": {
     "enabled": true,
