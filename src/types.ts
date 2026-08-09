@@ -150,6 +150,8 @@ export interface PublishJob {
   eventVersion: number;
   publishKey: string;
   story: StoryDraft;
+  mode?: "publish" | "edit";
+  telegramMessageId?: number;
 }
 
 export type QueueName = "radar-raw-ingest" | "radar-event-analysis" | "radar-editorial" | "radar-publish";
