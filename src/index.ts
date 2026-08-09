@@ -15,7 +15,7 @@ import { createCover } from "./publisher/covers";
 import { editPublishedStory, publishStory, verifyTelegramDestination } from "./publisher/telegram";
 import { isAdminRequest, isOperatorRequest, healthResponse, opsSummary } from "./ops";
 import type { PublishJob, SourceSeed, TelegramWebPollEnvelope, VerificationStatus } from "./types";
-import type { EditorialJob, PublishQueueJob, QueueJob, RawIngestJob, RawPostJob } from "./queue";
+import type { EditorialJob, PollCycleJob, PublishQueueJob, QueueJob, RawIngestJob, RawPostJob } from "./queue";
 
 interface PublishedEventState {
   publish_key: string;
@@ -73,14 +73,13 @@ export default {
     }
   },
 
-  async scheduled(_controller: ScheduledController, env: Env): Promise<void> {
-    await seedSourcesIfEmpty(env);
-    await recoverStalePublishJobs(env);
-    const envelopes = await pollDueSources(env);
-    for (const envelope of envelopes) {
-      await env.RAW_INGEST_QUEUE.send({ kind: "raw_ingest", envelope } satisfies RawIngestJob);
-    }
-    if (envelopes.length > 0) await incrementCounter(env.DB, "poll_envelopes_queued", envelopes.length);
+  // Free-plan Cron invocations have only 10 ms CPU. Keep this handler intentionally
+  // tiny: one Queue write and no D1 queries, Telegram fetches, parsing, hashing or recovery.
+  async scheduled(controller: ScheduledController, env: Env): Promise<void> {
+    await env.POLL_QUEUE.send({
+      kind: "poll_cycle",
+      scheduledAt: new Date(controller.scheduledTime).toISOString()
+    } satisfies PollCycleJob);
   },
 
   async queue(batch: MessageBatch<QueueJob>, env: Env): Promise<void> {
@@ -110,11 +109,62 @@ export default {
 };
 
 async function dispatchQueueJob(queue: string, body: QueueJob, env: Env): Promise<void> {
+  if (queue === "radar-poll" && body.kind === "poll_cycle") return processPollCycle(env, body);
   if (queue === "radar-raw-ingest" && body.kind === "raw_ingest") return processRawIngest(env, body);
   if (queue === "radar-event-analysis" && body.kind === "raw_post") return processAnalysis(env, body);
   if (queue === "radar-editorial" && body.kind === "editorial_candidate") return processEditorial(env, body);
   if (queue === "radar-publish" && body.kind === "publish") return processPublish(env, body);
   throw new Error(`queue_job_mismatch:${queue}:${body.kind}`);
+}
+
+async function processPollCycle(env: Env, job: PollCycleJob): Promise<void> {
+  await seedSourcesIfEmpty(env);
+
+  const scheduledAt = new Date(job.scheduledAt);
+  if (!Number.isNaN(scheduledAt.getTime()) && scheduledAt.getUTCMinutes() % 15 === 0) {
+    await recoverStalePublishJobs(env);
+  }
+
+  const envelopes = await pollDueSources(env);
+  await incrementCounter(env.DB, "poll_cycles");
+  if (envelopes.length > 0) await incrementCounter(env.DB, "poll_envelopes_observed", envelopes.length);
+
+  // Happy path stays in this Queue consumer. This avoids paying three Queue
+  // deliveries for every raw post on the Free plan. The old stage queues remain
+  // available as narrow fallbacks if a synchronous stage fails after persistence.
+  for (const envelope of envelopes) {
+    let rawPostId: number;
+    try {
+      rawPostId = await ingestEnvelope(env, envelope, { enqueueAnalysis: false });
+    } catch (error) {
+      const errorMessage = normalizeErrorMessage(error);
+      console.error(JSON.stringify({ event: "poll_sync_ingest_failed", source_id: envelope.sourceId, message_id: envelope.externalMessageId, error: errorMessage }));
+      await incrementCounter(env.DB, "poll_sync_ingest_failures");
+      await env.RAW_INGEST_QUEUE.send({ kind: "raw_ingest", envelope } satisfies RawIngestJob);
+      continue;
+    }
+
+    let candidate;
+    try {
+      candidate = await analyzeRawPost(env, rawPostId);
+    } catch (error) {
+      const errorMessage = normalizeErrorMessage(error);
+      console.error(JSON.stringify({ event: "poll_sync_analysis_failed", raw_post_id: rawPostId, error: errorMessage }));
+      await incrementCounter(env.DB, "poll_sync_analysis_failures");
+      await env.EVENT_ANALYSIS_QUEUE.send({ kind: "raw_post", rawPostId } satisfies RawPostJob);
+      continue;
+    }
+
+    if (!candidate) continue;
+    try {
+      await processEditorial(env, { kind: "editorial_candidate", candidate });
+    } catch (error) {
+      const errorMessage = normalizeErrorMessage(error);
+      console.error(JSON.stringify({ event: "poll_sync_editorial_failed", event_id: candidate.eventId, event_version: candidate.eventVersion, error: errorMessage }));
+      await incrementCounter(env.DB, "poll_sync_editorial_failures");
+      await env.EDITORIAL_QUEUE.send({ kind: "editorial_candidate", candidate } satisfies EditorialJob);
+    }
+  }
 }
 
 async function processRawIngest(env: Env, job: RawIngestJob): Promise<void> {
