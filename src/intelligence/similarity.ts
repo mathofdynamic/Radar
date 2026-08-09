@@ -14,12 +14,26 @@ export function cosineSimilarity(left: number[], right: number[]): number {
   return dot / Math.sqrt(leftMagnitude * rightMagnitude);
 }
 
+/**
+ * Lightweight lexical/time score used when embeddings are unavailable.
+ * Non-identical paraphrases can still reach a useful score; exact copies get a bonus.
+ */
 export function combinedSimilarity(left: string, right: string, temporalProximity: number): number {
   const overlap = lexicalOverlap(left, right);
   const leftTokens = lexicalTokens(left);
   const rightTokens = lexicalTokens(right);
   const exact = leftTokens.size > 0 && leftTokens.size === rightTokens.size && overlap === 1 ? 1 : 0;
-  return Math.min(1, exact * 0.35 + overlap * 0.55 + temporalProximity * 0.1);
+  return Math.min(1, exact * 0.2 + overlap * 0.7 + temporalProximity * 0.1);
+}
+
+/**
+ * Primary V2 event score. Semantic similarity carries most of the decision, while
+ * lexical/entity/time signals prevent unrelated stories with generic embeddings from merging.
+ */
+export function semanticEventScore(semantic: number, left: string, right: string, temporal: number): number {
+  const lexical = lexicalOverlap(left, right);
+  const entities = entityOverlap(left, right);
+  return Math.min(1, semantic * 0.68 + lexical * 0.17 + entities * 0.1 + temporal * 0.05);
 }
 
 export function temporalProximity(leftIso: string | null, rightIso: string | null, horizonHours = 48): number {
@@ -43,6 +57,15 @@ const entityPatterns: Array<[string, RegExp]> = [
 
 export function extractEntityKeys(text: string): string[] {
   return entityPatterns.filter(([, pattern]) => pattern.test(text)).map(([key]) => key);
+}
+
+export function entityOverlap(left: string, right: string): number {
+  const leftEntities = new Set(extractEntityKeys(left));
+  const rightEntities = new Set(extractEntityKeys(right));
+  if (leftEntities.size === 0 || rightEntities.size === 0) return 0;
+  let shared = 0;
+  for (const entity of leftEntities) if (rightEntities.has(entity)) shared += 1;
+  return shared / Math.max(leftEntities.size, rightEntities.size);
 }
 
 export function inferCategory(text: string, fallback = "IRAN"): string {
