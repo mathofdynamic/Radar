@@ -9,17 +9,17 @@
     "ENVIRONMENT": "production",
     "RADAR_DESTINATION_CHAT_ID": "-1004496469105",
     "RADAR_DESTINATION_URL": "https://t.me/RadarKhabarOnline",
-    "PUBLISH_ENABLED": "true",
-    "POLL_BATCH_SIZE": "2",
-    "POLL_INTERVAL_SECONDS": "900",
+    "PUBLISH_ENABLED": "false",
+    "POLL_BATCH_SIZE": "8",
+    "POLL_INTERVAL_SECONDS": "180",
     "MAX_HTML_BYTES": "524288",
     "AI_EMBEDDING_MODEL": "@cf/baai/bge-m3",
     "AI_TEXT_MODEL": "@cf/meta/llama-3.2-3b-instruct",
     "AI_IMAGE_MODEL": "@cf/black-forest-labs/flux-2-klein-4b",
     "AI_DAILY_NEURON_BUDGET": "8000",
-    "MAX_EMBEDDINGS_PER_DAY": "500",
-    "MAX_STAGE1_CALLS_PER_DAY": "100",
-    "MAX_STAGE2_CALLS_PER_DAY": "30",
+    "MAX_EMBEDDINGS_PER_DAY": "1500",
+    "MAX_STAGE1_CALLS_PER_DAY": "250",
+    "MAX_STAGE2_CALLS_PER_DAY": "40",
     "MAX_COVERS_PER_DAY": "10",
     "EDITORIAL_MIN_SCORE": "78",
     "BREAKING_SCORE": "90",
@@ -36,6 +36,7 @@
   ],
   "queues": {
     "producers": [
+      { "binding": "POLL_QUEUE", "queue": "radar-poll" },
       { "binding": "RAW_INGEST_QUEUE", "queue": "radar-raw-ingest" },
       { "binding": "EVENT_ANALYSIS_QUEUE", "queue": "radar-event-analysis" },
       { "binding": "EDITORIAL_QUEUE", "queue": "radar-editorial" },
@@ -43,6 +44,14 @@
       { "binding": "DEAD_LETTER_QUEUE", "queue": "radar-dead-letter" }
     ],
     "consumers": [
+      {
+        "queue": "radar-poll",
+        "max_batch_size": 1,
+        "max_batch_timeout": 1,
+        "max_retries": 3,
+        "dead_letter_queue": "radar-dead-letter",
+        "max_concurrency": 1
+      },
       { "queue": "radar-raw-ingest", "max_batch_size": 10, "max_batch_timeout": 10 },
       { "queue": "radar-event-analysis", "max_batch_size": 5, "max_batch_timeout": 10 },
       { "queue": "radar-editorial", "max_batch_size": 5, "max_batch_timeout": 10 },

@@ -1,18 +1,29 @@
 import { runtimeConfig } from "../config";
-import { getEvent, getRawPost, getSource, incrementCounter, listRecentRawPosts, upsertRawPost } from "../db";
-import { normalizePersianText } from "../normalization";
-import type { RawIngestJob, RawPostJob } from "../queue";
-import { combinedSimilarity, extractEntityKeys, inferCategory, temporalProximity } from "./similarity";
+import { getEvent, getSource, incrementCounter, listRecentRawPosts, upsertRawPost } from "../db";
+import { lexicalOverlap, normalizePersianText } from "../normalization";
+import type { RawPostJob } from "../queue";
+import { combinedSimilarity, extractEntityKeys, inferCategory, semanticEventScore, temporalProximity } from "./similarity";
 import { generateEmbedding } from "./ai";
 import { calculateVerification, classifyOrigin, originGroupFor, persistVerification } from "./verification";
 import { scoreEvent } from "../editorial/scoring";
 import type { EditorialCandidate, EventRow, RawPostRow, SourceRow, TelegramWebPollEnvelope } from "../types";
 
-export async function ingestEnvelope(env: Env, envelope: TelegramWebPollEnvelope): Promise<number> {
+interface SemanticNeighbor {
+  rawPostId: number;
+  score: number;
+}
+
+interface IngestOptions {
+  enqueueAnalysis?: boolean;
+}
+
+export async function ingestEnvelope(env: Env, envelope: TelegramWebPollEnvelope, options: IngestOptions = {}): Promise<number> {
   const source = await getSource(env.DB, envelope.sourceId);
   if (!source) throw new Error(`unknown_source:${envelope.sourceId}`);
   const rawPost = await upsertRawPost(env.DB, envelope, source.language);
-  await env.EVENT_ANALYSIS_QUEUE.send({ kind: "raw_post", rawPostId: rawPost.id } satisfies RawPostJob);
+  if (options.enqueueAnalysis !== false) {
+    await env.EVENT_ANALYSIS_QUEUE.send({ kind: "raw_post", rawPostId: rawPost.id } satisfies RawPostJob);
+  }
   await incrementCounter(env.DB, "raw_posts_persisted");
   return rawPost.id;
 }
@@ -33,6 +44,7 @@ export async function analyzeRawPost(env: Env, rawPostId: number): Promise<Edito
   }
 
   const embedding = await generateEmbedding(env, normalized.normalizedText);
+  let semanticNeighbors: SemanticNeighbor[] = [];
   if (embedding) {
     try {
       await env.EVENT_INDEX.upsert([{
@@ -40,26 +52,27 @@ export async function analyzeRawPost(env: Env, rawPostId: number): Promise<Edito
         values: embedding,
         metadata: { raw_post_id: rawPost.id, source_id: source.id, published_at: rawPost.published_at ?? "" }
       }]);
+      semanticNeighbors = await querySemanticNeighbors(env, rawPost.id, embedding);
       await incrementCounter(env.DB, "embeddings_generated");
     } catch (error) {
-      console.error(JSON.stringify({ event: "vectorize_upsert_failed", raw_post_id: rawPost.id, error: error instanceof Error ? error.message : "unknown" }));
+      console.error(JSON.stringify({ event: "vectorize_operation_failed", raw_post_id: rawPost.id, error: error instanceof Error ? error.message : "unknown" }));
     }
   } else {
     await incrementCounter(env.DB, "embeddings_deferred");
   }
 
-  const duplicate = await findNearDuplicate(env.DB, rawPost, normalized.normalizedText);
+  // Duplicate content remains evidence. Record the relationship, but never return early:
+  // an independently published duplicate may be the confirmation that makes an event trustworthy.
+  const duplicate = await findNearDuplicate(env.DB, rawPost, normalized.normalizedText, semanticNeighbors);
   if (duplicate) {
     await env.DB.prepare(
       `INSERT INTO raw_post_duplicates(raw_post_id, duplicate_of_raw_post_id, similarity_score, reason_json, created_at)
        VALUES (?, ?, ?, ?, ?) ON CONFLICT(raw_post_id, duplicate_of_raw_post_id) DO NOTHING`
-    ).bind(rawPost.id, duplicate.id, duplicate.score, JSON.stringify({ method: "lexical_temporal" }), new Date().toISOString()).run();
-    await env.DB.prepare("UPDATE raw_posts SET processing_status = 'duplicate', updated_at = ? WHERE id = ?").bind(new Date().toISOString(), rawPost.id).run();
+    ).bind(rawPost.id, duplicate.id, duplicate.score, JSON.stringify({ method: duplicate.method }), new Date().toISOString()).run();
     await incrementCounter(env.DB, "duplicates_detected");
-    return null;
   }
 
-  const event = await findOrCreateEvent(env, rawPost, source, normalized.normalizedText);
+  const event = await findOrCreateEvent(env, rawPost, source, normalized.normalizedText, semanticNeighbors);
   await recalculateEvent(env, event.id);
   const refreshed = await getEvent(env.DB, event.id);
   if (!refreshed) throw new Error(`event_missing_after_recalculate:${event.id}`);
@@ -93,26 +106,59 @@ export async function analyzeRawPost(env: Env, rawPostId: number): Promise<Edito
   };
 }
 
-async function findNearDuplicate(db: D1Database, rawPost: RawPostRow, text: string): Promise<{ id: number; score: number } | null> {
-  const recent = await listRecentRawPosts(db, 80);
-  let best: { id: number; score: number } | null = null;
+async function querySemanticNeighbors(env: Env, rawPostId: number, embedding: number[]): Promise<SemanticNeighbor[]> {
+  const result = await env.EVENT_INDEX.query(embedding, { topK: 12, returnMetadata: "all" });
+  const neighbors: SemanticNeighbor[] = [];
+  for (const match of result.matches) {
+    const candidateRawPostId = Number(match.metadata?.raw_post_id);
+    if (!Number.isSafeInteger(candidateRawPostId) || candidateRawPostId <= 0 || candidateRawPostId === rawPostId) continue;
+    neighbors.push({ rawPostId: candidateRawPostId, score: match.score });
+  }
+  return neighbors;
+}
+
+async function findNearDuplicate(
+  db: D1Database,
+  rawPost: RawPostRow,
+  text: string,
+  semanticNeighbors: SemanticNeighbor[]
+): Promise<{ id: number; score: number; method: string } | null> {
+  const recent = await listRecentRawPosts(db, 100);
+  const semanticById = new Map(semanticNeighbors.map((neighbor) => [neighbor.rawPostId, neighbor.score]));
+  let best: { id: number; score: number; method: string } | null = null;
   for (const candidate of recent) {
     if (candidate.id === rawPost.id || candidate.source_id === rawPost.source_id) continue;
-    const score = combinedSimilarity(text, candidate.normalized_text || candidate.original_text, temporalProximity(rawPost.published_at, candidate.published_at));
-    if (score >= 0.82 && (!best || score > best.score)) best = { id: candidate.id, score };
+    const candidateText = candidate.normalized_text || candidate.original_text;
+    const temporal = temporalProximity(rawPost.published_at, candidate.published_at);
+    const lexical = combinedSimilarity(text, candidateText, temporal);
+    const semantic = semanticById.get(candidate.id) ?? 0;
+    const score = Math.max(lexical, semanticEventScore(semantic, text, candidateText, temporal));
+    if (score >= 0.84 && (!best || score > best.score)) {
+      best = { id: candidate.id, score, method: semantic > lexical ? "semantic_lexical_temporal" : "lexical_temporal" };
+    }
   }
   return best;
 }
 
-async function findOrCreateEvent(env: Env, rawPost: RawPostRow, source: SourceRow, text: string): Promise<EventRow> {
+async function findOrCreateEvent(
+  env: Env,
+  rawPost: RawPostRow,
+  source: SourceRow,
+  text: string,
+  semanticNeighbors: SemanticNeighbor[]
+): Promise<EventRow> {
   const candidates = await env.DB.prepare(
     `SELECT * FROM events WHERE event_state = 'active' AND last_updated_at >= ? ORDER BY last_updated_at DESC LIMIT 100`
   ).bind(new Date(Date.now() - 48 * 3_600_000).toISOString()).all<EventRow>();
+  const semanticEventScores = await semanticScoresByEvent(env.DB, semanticNeighbors);
   let best: { event: EventRow; score: number } | null = null;
   for (const candidate of candidates.results) {
-    const score = combinedSimilarity(text, candidate.core_fact, temporalProximity(rawPost.published_at, candidate.first_seen_at));
-    if (inferCategory(text) !== candidate.category && score < 0.7) continue;
-    if (score >= 0.58 && (!best || score > best.score)) best = { event: candidate, score };
+    const temporal = temporalProximity(rawPost.published_at, candidate.first_seen_at);
+    const lexical = combinedSimilarity(text, candidate.core_fact, temporal);
+    const semantic = semanticEventScores.get(candidate.id) ?? 0;
+    const score = Math.max(lexical, semanticEventScore(semantic, text, candidate.core_fact, temporal));
+    if (inferCategory(text) !== candidate.category && score < 0.72) continue;
+    if (score >= 0.62 && (!best || score > best.score)) best = { event: candidate, score };
   }
   const timestamp = new Date().toISOString();
   if (best) {
@@ -139,14 +185,26 @@ async function findOrCreateEvent(env: Env, rawPost: RawPostRow, source: SourceRo
   return created;
 }
 
+async function semanticScoresByEvent(db: D1Database, neighbors: SemanticNeighbor[]): Promise<Map<number, number>> {
+  const result = new Map<number, number>();
+  for (const neighbor of neighbors) {
+    const row = await db.prepare("SELECT event_id FROM event_sources WHERE raw_post_id = ? ORDER BY id DESC LIMIT 1")
+      .bind(neighbor.rawPostId).first<{ event_id: number }>();
+    if (!row) continue;
+    const current = result.get(row.event_id) ?? 0;
+    if (neighbor.score > current) result.set(row.event_id, neighbor.score);
+  }
+  return result;
+}
+
 async function attachEventSource(env: Env, eventId: number, rawPost: RawPostRow, source: SourceRow, text: string): Promise<void> {
   const related = await env.DB.prepare(
     `SELECT es.origin_group, rp.normalized_text FROM event_sources es JOIN raw_posts rp ON rp.id = es.raw_post_id
       WHERE es.event_id = ? ORDER BY es.id DESC LIMIT 30`
   ).bind(eventId).all<{ origin_group: string; normalized_text: string }>();
-  const existing = related.results.find((candidate) => combinedSimilarity(text, candidate.normalized_text, 1) >= 0.7);
+  const copiedFrom = related.results.find((candidate) => lexicalOverlap(text, candidate.normalized_text) >= 0.86);
   const originType = classifyOrigin(source, rawPost);
-  const originGroup = originGroupFor(source, rawPost, existing?.origin_group);
+  const originGroup = originGroupFor(source, rawPost, copiedFrom?.origin_group);
   await env.DB.prepare(
     `INSERT INTO event_sources(event_id, raw_post_id, source_id, origin_type, origin_group, supports_core_fact, relationship_confidence, dependency_reason, created_at)
      VALUES (?, ?, ?, ?, ?, 1, ?, ?, ?) ON CONFLICT(event_id, raw_post_id) DO NOTHING`
@@ -156,8 +214,8 @@ async function attachEventSource(env: Env, eventId: number, rawPost: RawPostRow,
     source.id,
     originType,
     originGroup,
-    existing ? 0.8 : 0.55,
-    existing ? "high_similarity_to_existing_origin" : null,
+    copiedFrom ? 0.9 : originType === "unknown" ? 0.55 : 0.8,
+    copiedFrom ? "strong_lexical_copy_relationship" : null,
     new Date().toISOString()
   ).run();
   for (const entityKey of extractEntityKeys(text)) {
@@ -180,8 +238,4 @@ async function recalculateEvent(env: Env, eventId: number): Promise<void> {
   if (!event) throw new Error(`event_not_found:${eventId}`);
   const verification = calculateVerification(event, evidence.results.map((row) => ({ source: row, rawPost: row, originGroup: row.origin_group, originType: row.origin_type })));
   await persistVerification(env.DB, eventId, verification);
-}
-
-export function isRawIngestJob(value: unknown): value is RawIngestJob {
-  return typeof value === "object" && value !== null && (value as { kind?: unknown }).kind === "raw_ingest";
 }

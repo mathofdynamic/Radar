@@ -11,6 +11,13 @@ describe("Telegram public page parser", () => {
     expect(result.posts[0].text).toContain("ایران & بازار");
   });
 
+  it("captures forward and cited-source hints when exposed", async () => {
+    const html = `<div class="tgme_widget_message_wrap" data-post="example/44"><a class="tgme_widget_message_forwarded_from" href="https://t.me/reuters">Reuters</a><div class="tgme_widget_message_text">به نقل از رویترز، مذاکرات امروز ادامه دارد</div><time datetime="2026-08-08T10:10:00+00:00">10:10</time></div>`;
+    const result = await parseTelegramPublicPage(html, 1, "example", "example");
+    expect(result.posts[0].metadata.forwarded_from).toBe("reuters");
+    expect(result.posts[0].metadata.cited_source).toBe("reuters");
+  });
+
   it("rejects an unrecognized page as a parser warning", async () => {
     const result = await parseTelegramPublicPage("<html>blocked</html>", 1, "example", "example");
     expect(result.posts).toHaveLength(0);

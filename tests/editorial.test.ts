@@ -14,6 +14,11 @@ describe("editorial engine", () => {
     expect(score.band).toBe("CANDIDATE");
   });
 
+  it("does not automatically elevate a routine politics event into breaking", () => {
+    const score = scoreEvent(baseEvent({ category: "POLITICS", verification_status: "CONFIRMED", independent_confirmation_count: 2 }));
+    expect(score.finalScore).toBeLessThan(90);
+  });
+
   it("blocks unverified automatic publication", () => {
     const event = baseEvent({ verification_status: "UNVERIFIED", independent_confirmation_count: 0 });
     expect(shouldPublish(event, scoreEvent(event), true, 0, { editorialMinScore: 78, breakingScore: 90, dailyStoryBudget: 15, busyDayStoryBudget: 25 })).toBe(false);
@@ -23,6 +28,11 @@ describe("editorial engine", () => {
     const caption = formatCaption({ eventId: 1, eventVersion: 1, title: "<خبر>", description: "شرح", verificationStatus: "CONFIRMED", independentConfirmations: 2, primarySources: [], category: "IRAN", tags: ["ایران"], links: [{ label: "منبع", url: "https://t.me/a/1" }], coverConcept: "symbolic" });
     expect(caption).toContain("&lt;خبر&gt;");
     expect(caption).toContain("#ایران");
+  });
+
+  it("keeps photo captions safely below Telegram's maximum", () => {
+    const caption = formatCaption({ eventId: 1, eventVersion: 1, title: "خبر مهم", description: "توضیح ".repeat(250), verificationStatus: "CONFIRMED", independentConfirmations: 3, primarySources: [], category: "IRAN", tags: ["ایران", "سیاست"], links: [], coverConcept: "symbolic" });
+    expect(Array.from(caption).length).toBeLessThan(1_024);
   });
 
   it("does not repeat a duplicated title or metadata in the caption", () => {

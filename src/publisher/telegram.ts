@@ -8,6 +8,8 @@ interface TelegramResponse {
   description?: string;
 }
 
+const MAX_PARSED_CAPTION_CHARS = 900;
+
 export async function publishStory(env: Env, story: StoryDraft, cover: CoverArtifact): Promise<number> {
   if (!env.TELEGRAM_BOT_TOKEN) throw new Error("telegram_bot_token_missing");
   try {
@@ -19,6 +21,19 @@ export async function publishStory(env: Env, story: StoryDraft, cover: CoverArti
     }
     throw error;
   }
+}
+
+export async function editPublishedStory(env: Env, story: StoryDraft, telegramMessageId: number): Promise<void> {
+  if (!env.TELEGRAM_BOT_TOKEN) throw new Error("telegram_bot_token_missing");
+  const form = new FormData();
+  form.append("chat_id", env.RADAR_DESTINATION_CHAT_ID);
+  form.append("message_id", String(telegramMessageId));
+  form.append("caption", formatCaption(story));
+  form.append("parse_mode", "HTML");
+  form.append("reply_markup", JSON.stringify(buildReplyMarkup(story)));
+  const response = await fetch(`https://api.telegram.org/bot${env.TELEGRAM_BOT_TOKEN}/editMessageCaption`, { method: "POST", body: form });
+  const payload = await response.json() as TelegramResponse;
+  if (!response.ok || !payload.ok) throw new Error(`telegram_edit_failed:${payload.description ?? response.status}`);
 }
 
 async function sendPhoto(env: Env, story: StoryDraft, cover: CoverArtifact): Promise<number> {
@@ -49,14 +64,21 @@ export async function verifyTelegramDestination(env: Env): Promise<{ ok: boolean
 
 export function formatCaption(story: StoryDraft): string {
   const title = cleanEditorialText(story.title);
-  const description = cleanDescription(story.title, story.description);
   const status = verificationLabel(story.verificationStatus);
+  const statusLine = `وضعیت: ${status}`;
+  const confirmationsLine = `تأیید مستقل: ${toPersianDigits(story.independentConfirmations)}`;
   const tags = story.tags.map((tag) => `#${tag.replace(/\s+/gu, "_")}`).join(" ");
+  const rawDescription = cleanDescription(story.title, story.description);
+  const fixedSections = [title, statusLine, confirmationsLine, tags].filter(Boolean);
+  const separatorLength = 2 * Math.max(0, fixedSections.length);
+  const fixedLength = fixedSections.reduce((sum, section) => sum + Array.from(section).length, 0) + separatorLength;
+  const descriptionBudget = Math.max(0, MAX_PARSED_CAPTION_CHARS - fixedLength);
+  const description = truncateUnicode(rawDescription, descriptionBudget);
   const sections = [
     `<b>${escapeHtml(title)}</b>`,
     description ? escapeHtml(description) : null,
-    `وضعیت: ${status}`,
-    `تأیید مستقل: ${toPersianDigits(story.independentConfirmations)}`,
+    statusLine,
+    confirmationsLine,
     tags ? escapeHtml(tags) : null
   ].filter((section): section is string => section !== null);
   return `\u200f${sections.join("\n\n")}`;
@@ -98,6 +120,13 @@ function cleanDescription(title: string, value: string): string {
     .join("\n")
     .trim();
   return cleanEditorialText(description);
+}
+
+function truncateUnicode(value: string, maxLength: number): string {
+  const chars = Array.from(value);
+  if (chars.length <= maxLength) return value;
+  if (maxLength <= 1) return maxLength === 1 ? "…" : "";
+  return `${chars.slice(0, maxLength - 1).join("")}…`;
 }
 
 function verificationLabel(status: StoryDraft["verificationStatus"]): string {

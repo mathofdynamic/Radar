@@ -8,14 +8,22 @@ import { dashboardSnapshot } from "./dashboard-data";
 import { dashboardResponse } from "./dashboard";
 import { analyzeRawPost, ingestEnvelope } from "./intelligence/pipeline";
 import { buildStoryDraft } from "./editorial/story";
-import { scoreEvent, shouldPublish } from "./editorial/scoring";
+import { judgeEvent } from "./editorial/judge";
+import { scoreEvent, scoreWithAdjustment, shouldPublish } from "./editorial/scoring";
 import { pollDueSources } from "./polling/poller";
 import { createCover } from "./publisher/covers";
-import { publishStory } from "./publisher/telegram";
-import { verifyTelegramDestination } from "./publisher/telegram";
+import { editPublishedStory, publishStory, verifyTelegramDestination } from "./publisher/telegram";
 import { isAdminRequest, isOperatorRequest, healthResponse, opsSummary } from "./ops";
-import type { EditorialCandidate, EventRow, PublishJob, SourceSeed, StoryDraft, TelegramWebPollEnvelope } from "./types";
-import type { EditorialJob, PublishQueueJob, QueueJob, RawIngestJob, RawPostJob } from "./queue";
+import type { PublishJob, SourceSeed, TelegramWebPollEnvelope, VerificationStatus } from "./types";
+import type { EditorialJob, PollCycleJob, PublishQueueJob, QueueJob, RawIngestJob, RawPostJob } from "./queue";
+
+interface PublishedEventState {
+  publish_key: string;
+  event_version: number;
+  telegram_message_id: number | null;
+  verification_status: VerificationStatus;
+  independent_confirmations: number;
+}
 
 export default {
   async fetch(request: Request, env: Env): Promise<Response> {
@@ -65,14 +73,13 @@ export default {
     }
   },
 
-  async scheduled(_controller: ScheduledController, env: Env): Promise<void> {
-    await seedSourcesIfEmpty(env);
-    await recoverStalePublishJobs(env);
-    const envelopes = await pollDueSources(env);
-    for (const envelope of envelopes) {
-      await env.RAW_INGEST_QUEUE.send({ kind: "raw_ingest", envelope } satisfies RawIngestJob);
-    }
-    if (envelopes.length > 0) await incrementCounter(env.DB, "poll_envelopes_queued", envelopes.length);
+  // Free-plan Cron invocations have only 10 ms CPU. Keep this handler intentionally
+  // tiny: one Queue write and no D1 queries, Telegram fetches, parsing, hashing or recovery.
+  async scheduled(controller: ScheduledController, env: Env): Promise<void> {
+    await env.POLL_QUEUE.send({
+      kind: "poll_cycle",
+      scheduledAt: new Date(controller.scheduledTime).toISOString()
+    } satisfies PollCycleJob);
   },
 
   async queue(batch: MessageBatch<QueueJob>, env: Env): Promise<void> {
@@ -85,7 +92,11 @@ export default {
         console.error(JSON.stringify({ event: "queue_job_failed", queue: batch.queue, error: errorMessage }));
         if (batch.queue === "radar-publish" && message.body.kind === "publish") {
           try {
-            await recordPublishFailure(env.DB, message.body.job.eventId, message.body.job.eventVersion, message.body.job.publishKey, errorMessage);
+            if (message.body.job.mode === "edit") {
+              await recordUpdateFailure(env.DB, message.body.job.eventId, message.body.job.eventVersion, message.body.job.publishKey, errorMessage);
+            } else {
+              await recordPublishFailure(env.DB, message.body.job.eventId, message.body.job.eventVersion, message.body.job.publishKey, errorMessage);
+            }
           } catch (recordError) {
             console.error(JSON.stringify({ event: "publish_failure_record_failed", error: normalizeErrorMessage(recordError) }));
           }
@@ -98,11 +109,62 @@ export default {
 };
 
 async function dispatchQueueJob(queue: string, body: QueueJob, env: Env): Promise<void> {
+  if (queue === "radar-poll" && body.kind === "poll_cycle") return processPollCycle(env, body);
   if (queue === "radar-raw-ingest" && body.kind === "raw_ingest") return processRawIngest(env, body);
   if (queue === "radar-event-analysis" && body.kind === "raw_post") return processAnalysis(env, body);
   if (queue === "radar-editorial" && body.kind === "editorial_candidate") return processEditorial(env, body);
   if (queue === "radar-publish" && body.kind === "publish") return processPublish(env, body);
   throw new Error(`queue_job_mismatch:${queue}:${body.kind}`);
+}
+
+async function processPollCycle(env: Env, job: PollCycleJob): Promise<void> {
+  await seedSourcesIfEmpty(env);
+
+  const scheduledAt = new Date(job.scheduledAt);
+  if (!Number.isNaN(scheduledAt.getTime()) && scheduledAt.getUTCMinutes() % 15 === 0) {
+    await recoverStalePublishJobs(env);
+  }
+
+  const envelopes = await pollDueSources(env);
+  await incrementCounter(env.DB, "poll_cycles");
+  if (envelopes.length > 0) await incrementCounter(env.DB, "poll_envelopes_observed", envelopes.length);
+
+  // Happy path stays in this Queue consumer. This avoids paying three Queue
+  // deliveries for every raw post on the Free plan. The old stage queues remain
+  // available as narrow fallbacks if a synchronous stage fails after persistence.
+  for (const envelope of envelopes) {
+    let rawPostId: number;
+    try {
+      rawPostId = await ingestEnvelope(env, envelope, { enqueueAnalysis: false });
+    } catch (error) {
+      const errorMessage = normalizeErrorMessage(error);
+      console.error(JSON.stringify({ event: "poll_sync_ingest_failed", source_id: envelope.sourceId, message_id: envelope.externalMessageId, error: errorMessage }));
+      await incrementCounter(env.DB, "poll_sync_ingest_failures");
+      await env.RAW_INGEST_QUEUE.send({ kind: "raw_ingest", envelope } satisfies RawIngestJob);
+      continue;
+    }
+
+    let candidate;
+    try {
+      candidate = await analyzeRawPost(env, rawPostId);
+    } catch (error) {
+      const errorMessage = normalizeErrorMessage(error);
+      console.error(JSON.stringify({ event: "poll_sync_analysis_failed", raw_post_id: rawPostId, error: errorMessage }));
+      await incrementCounter(env.DB, "poll_sync_analysis_failures");
+      await env.EVENT_ANALYSIS_QUEUE.send({ kind: "raw_post", rawPostId } satisfies RawPostJob);
+      continue;
+    }
+
+    if (!candidate) continue;
+    try {
+      await processEditorial(env, { kind: "editorial_candidate", candidate });
+    } catch (error) {
+      const errorMessage = normalizeErrorMessage(error);
+      console.error(JSON.stringify({ event: "poll_sync_editorial_failed", event_id: candidate.eventId, event_version: candidate.eventVersion, error: errorMessage }));
+      await incrementCounter(env.DB, "poll_sync_editorial_failures");
+      await env.EDITORIAL_QUEUE.send({ kind: "editorial_candidate", candidate } satisfies EditorialJob);
+    }
+  }
 }
 
 async function processRawIngest(env: Env, job: RawIngestJob): Promise<void> {
@@ -119,33 +181,132 @@ async function processEditorial(env: Env, job: EditorialJob): Promise<void> {
   const candidate = job.candidate;
   const event = await getEvent(env.DB, candidate.eventId);
   if (!event || event.event_version !== candidate.eventVersion) return;
+
   const source = await env.DB.prepare(
     `SELECT MAX(CASE WHEN s.priority_tier = 'TIER_1' THEN 1 ELSE 0 END) AS high_priority
        FROM event_sources es JOIN sources s ON s.id = es.source_id WHERE es.event_id = ?`
   ).bind(event.id).first<{ high_priority: number | null }>();
   const config = runtimeConfig(env);
-  const score = scoreEvent(event);
+  const deterministicScore = scoreEvent(event);
+  const judgment = await judgeEvent(env, event, deterministicScore);
+  const score = scoreWithAdjustment(deterministicScore, judgment.adjustedScore - deterministicScore.finalScore);
   const publishedToday = await countStoriesToday(env.DB);
-  const alreadyPublished = await env.DB.prepare(
-    "SELECT 1 AS found FROM published_stories WHERE event_id = ? AND publication_state = 'published' LIMIT 1"
-  ).bind(event.id).first<{ found: number }>();
-  const publish = !alreadyPublished && shouldPublish(event, score, (source?.high_priority ?? 0) === 1, publishedToday, config);
-  const decision = publish ? "PUBLISH" : alreadyPublished ? "MONITOR" : score.finalScore >= 60 ? "MONITOR" : "IGNORE";
-  const reasons = alreadyPublished ? [...score.reasons, "already_published_event"] : score.reasons;
-  const candidateStatus = alreadyPublished ? "suppressed_duplicate" : publish && String(env.PUBLISH_ENABLED) === "true" ? "queued" : "pending";
-  await env.DB.prepare(
-    `INSERT INTO editorial_candidates(event_id, event_version, decision, score, reason_json, status, created_at, updated_at)
-     VALUES (?, ?, ?, ?, ?, ?, ?, ?) ON CONFLICT(event_id, event_version) DO UPDATE SET decision = excluded.decision, score = excluded.score, reason_json = excluded.reason_json, updated_at = excluded.updated_at`
-  ).bind(event.id, event.event_version, decision, score.finalScore, JSON.stringify(reasons), candidateStatus, new Date().toISOString(), new Date().toISOString()).run();
+  const existingPublished = await env.DB.prepare(
+    `SELECT publish_key, event_version, telegram_message_id, verification_status, independent_confirmations
+       FROM published_stories
+      WHERE event_id = ? AND publication_state = 'published'
+      ORDER BY id ASC LIMIT 1`
+  ).bind(event.id).first<PublishedEventState>();
+
+  const aiAllowsNewPublication = !judgment.usedAi
+    || judgment.recommendation === "PUBLISH"
+    || (judgment.recommendation === "MONITOR" && judgment.isBreakingCandidate && score.finalScore >= config.breakingScore);
+  const publish = !existingPublished
+    && aiAllowsNewPublication
+    && shouldPublish(event, score, (source?.high_priority ?? 0) === 1, publishedToday, config);
+  const materialUpdate = existingPublished ? shouldEditPublishedStory(event, score.finalScore, existingPublished, config.breakingScore) : false;
+  const reasons = [
+    ...score.reasons,
+    `ai_editor:${judgment.usedAi ? judgment.recommendation : "fallback"}`,
+    `ai_editor_reason:${judgment.reason}`,
+    `effective_score:${score.finalScore}`
+  ];
+  const decision = publish ? "PUBLISH" : score.finalScore >= 60 ? "MONITOR" : "IGNORE";
+  const candidateStatus = materialUpdate
+    ? String(env.PUBLISH_ENABLED) === "true" ? "update_queued" : "update_pending"
+    : publish && String(env.PUBLISH_ENABLED) === "true" ? "queued" : "pending";
+
+  await env.DB.batch([
+    env.DB.prepare(
+      `INSERT INTO editorial_candidates(event_id, event_version, decision, score, reason_json, status, created_at, updated_at)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+       ON CONFLICT(event_id, event_version) DO UPDATE SET decision = excluded.decision, score = excluded.score, reason_json = excluded.reason_json, status = excluded.status, updated_at = excluded.updated_at`
+    ).bind(event.id, event.event_version, decision, score.finalScore, JSON.stringify(reasons), candidateStatus, new Date().toISOString(), new Date().toISOString()),
+    env.DB.prepare("UPDATE events SET importance_score = ?, subscores_json = ?, updated_at = ? WHERE id = ?")
+      .bind(score.finalScore, JSON.stringify({ ...score, ai_editor: judgment }), new Date().toISOString(), event.id)
+  ]);
+
+  if (materialUpdate && existingPublished?.telegram_message_id) {
+    if (String(env.PUBLISH_ENABLED) !== "true") return;
+    const story = await buildStoryDraft(env, event.id, event.event_version, reasons);
+    const editJob: PublishJob = {
+      eventId: event.id,
+      eventVersion: event.event_version,
+      publishKey: existingPublished.publish_key,
+      story,
+      mode: "edit",
+      telegramMessageId: existingPublished.telegram_message_id
+    };
+    await env.PUBLISH_QUEUE.send({ kind: "publish", job: editJob } satisfies PublishQueueJob);
+    return;
+  }
+
   if (!publish) return;
-  const story = await buildStoryDraft(env, event.id, event.event_version, score.reasons);
-  const publishJob: PublishJob = { eventId: event.id, eventVersion: event.event_version, publishKey: `event:${event.id}:version:${event.event_version}`, story };
+  const story = await buildStoryDraft(env, event.id, event.event_version, reasons);
+  const publishJob: PublishJob = {
+    eventId: event.id,
+    eventVersion: event.event_version,
+    publishKey: `event:${event.id}:version:${event.event_version}`,
+    story,
+    mode: "publish"
+  };
   if (String(env.PUBLISH_ENABLED) === "true") await env.PUBLISH_QUEUE.send({ kind: "publish", job: publishJob } satisfies PublishQueueJob);
 }
 
 async function processPublish(env: Env, job: PublishQueueJob): Promise<void> {
   if (String(env.PUBLISH_ENABLED) !== "true") return;
-  const existing = await env.DB.prepare("SELECT publication_state FROM published_stories WHERE publish_key = ?").bind(job.job.publishKey).first<{ publication_state: string }>();
+
+  if (job.job.mode === "edit") {
+    if (!job.job.telegramMessageId) throw new Error("telegram_edit_message_id_missing");
+    const previous = await env.DB.prepare(
+      "SELECT event_version, title, description, verification_status, independent_confirmations FROM published_stories WHERE publish_key = ?"
+    ).bind(job.job.publishKey).first<{ event_version: number; title: string; description: string; verification_status: string; independent_confirmations: number }>();
+    if (!previous) throw new Error(`published_story_missing_for_edit:${job.job.publishKey}`);
+    if (previous.event_version >= job.job.eventVersion) return;
+
+    await editPublishedStory(env, job.job.story, job.job.telegramMessageId);
+    const timestamp = new Date().toISOString();
+    const updateType = classifyPublishedUpdate(previous.verification_status, job.job.story.verificationStatus);
+    await env.DB.batch([
+      env.DB.prepare(
+        `UPDATE published_stories SET event_version = ?, title = ?, description = ?, verification_status = ?, independent_confirmations = ?,
+          primary_sources_json = ?, category = ?, entity_tags_json = ?, links_json = ?, story_model = ?, last_error = NULL, updated_at = ?
+          WHERE publish_key = ?`
+      ).bind(
+        job.job.story.eventVersion,
+        job.job.story.title,
+        job.job.story.description,
+        job.job.story.verificationStatus,
+        job.job.story.independentConfirmations,
+        JSON.stringify(job.job.story.primarySources),
+        job.job.story.category,
+        JSON.stringify(job.job.story.tags),
+        JSON.stringify(job.job.story.links),
+        env.AI_TEXT_MODEL,
+        timestamp,
+        job.job.publishKey
+      ),
+      env.DB.prepare(
+        `INSERT INTO event_updates(event_id, event_version, update_type, previous_snapshot_json, new_snapshot_json, editorial_action, reason, created_at)
+         VALUES (?, ?, ?, ?, ?, 'EDIT_TELEGRAM', ?, ?)`
+      ).bind(
+        job.job.eventId,
+        job.job.eventVersion,
+        updateType,
+        JSON.stringify(previous),
+        JSON.stringify({ verification_status: job.job.story.verificationStatus, independent_confirmations: job.job.story.independentConfirmations, title: job.job.story.title, description: job.job.story.description }),
+        "material published-story update",
+        timestamp
+      ),
+      env.DB.prepare("UPDATE editorial_candidates SET status = 'updated', updated_at = ? WHERE event_id = ? AND event_version = ?")
+        .bind(timestamp, job.job.eventId, job.job.eventVersion)
+    ]);
+    await incrementCounter(env.DB, "stories_edited");
+    return;
+  }
+
+  const existing = await env.DB.prepare("SELECT publication_state FROM published_stories WHERE publish_key = ?")
+    .bind(job.job.publishKey).first<{ publication_state: string }>();
   if (existing?.publication_state === "published") return;
   if (!(await claimEventPublication(env, job.job))) {
     await suppressDuplicatePublication(env, job.job.eventId, job.job.eventVersion, job.job.publishKey);
@@ -165,6 +326,20 @@ async function processPublish(env: Env, job: PublishQueueJob): Promise<void> {
     .bind(new Date().toISOString(), job.job.eventId, job.job.eventVersion)
     .run();
   await incrementCounter(env.DB, "stories_published");
+}
+
+function shouldEditPublishedStory(event: Awaited<ReturnType<typeof getEvent>> & {}, score: number, published: PublishedEventState, breakingScore: number): boolean {
+  if (!published.telegram_message_id || event.event_version <= published.event_version) return false;
+  if (event.verification_status !== published.verification_status) return true;
+  if (event.verification_status === "CONFIRMED" && event.independent_confirmation_count >= published.independent_confirmations + 2) return true;
+  return score >= breakingScore && event.independent_confirmation_count > published.independent_confirmations;
+}
+
+function classifyPublishedUpdate(previous: string, next: string): string {
+  if (previous === "CONFIRMED" && next === "DISPUTED") return "CONTRADICTION";
+  if (previous !== "CONFIRMED" && next === "CONFIRMED") return "MAJOR_UPDATE";
+  if (previous !== next) return "MAJOR_UPDATE";
+  return "MINOR_UPDATE";
 }
 
 async function claimEventPublication(env: Env, job: PublishJob): Promise<boolean> {
@@ -213,6 +388,16 @@ async function recordPublishFailure(db: D1Database, eventId: number, eventVersio
   ]);
 }
 
+async function recordUpdateFailure(db: D1Database, eventId: number, eventVersion: number, publishKey: string, error: string): Promise<void> {
+  const timestamp = new Date().toISOString();
+  await db.batch([
+    db.prepare("UPDATE published_stories SET last_error = ?, updated_at = ? WHERE publish_key = ?")
+      .bind(error.slice(0, 1_000), timestamp, publishKey),
+    db.prepare("UPDATE editorial_candidates SET status = 'update_failed', updated_at = ? WHERE event_id = ? AND event_version = ?")
+      .bind(timestamp, eventId, eventVersion)
+  ]);
+}
+
 async function recoverStalePublishJobs(env: Env): Promise<void> {
   if (String(env.PUBLISH_ENABLED) !== "true") return;
   const cutoff = new Date(Date.now() - 10 * 60 * 1_000).toISOString();
@@ -231,7 +416,7 @@ async function recoverStalePublishJobs(env: Env): Promise<void> {
       const story = await buildStoryDraft(env, row.event_id, row.event_version, ["automatic_publish_recovery"]);
       await env.PUBLISH_QUEUE.send({
         kind: "publish",
-        job: { eventId: row.event_id, eventVersion: row.event_version, publishKey: row.publish_key, story }
+        job: { eventId: row.event_id, eventVersion: row.event_version, publishKey: row.publish_key, story, mode: "publish" }
       } satisfies PublishQueueJob);
       const timestamp = new Date().toISOString();
       await env.DB.batch([
@@ -265,7 +450,7 @@ async function validateSources(env: Env): Promise<{ activated: string[]; inactiv
   const inactive: Array<{ source: string; reason: string }> = [];
   for (const source of rows.results) {
     try {
-      const response = await fetch(`https://t.me/s/${encodeURIComponent(source.telegram_username)}`, { headers: { accept: "text/html", "user-agent": "Radar/0.1 source-validator" } });
+      const response = await fetch(`https://t.me/s/${encodeURIComponent(source.telegram_username)}`, { headers: { accept: "text/html", "user-agent": "Radar/0.2 source-validator" } });
       if (!response.ok) throw new Error(`http_${response.status}`);
       const html = await readBoundedText(response, runtimeConfig(env).maxHtmlBytes);
       if (!html.includes("data-post=")) throw new Error("no_public_posts");
@@ -294,7 +479,7 @@ async function requeuePending(env: Env): Promise<{ queued: number }> {
   let queued = 0;
   for (const row of rows.results) {
     const story = await buildStoryDraft(env, row.event_id, row.event_version, ["requeued_after_publishing_enable"]);
-    await env.PUBLISH_QUEUE.send({ kind: "publish", job: { eventId: row.event_id, eventVersion: row.event_version, publishKey: row.publish_key, story } } satisfies PublishQueueJob);
+    await env.PUBLISH_QUEUE.send({ kind: "publish", job: { eventId: row.event_id, eventVersion: row.event_version, publishKey: row.publish_key, story, mode: "publish" } } satisfies PublishQueueJob);
     const timestamp = new Date().toISOString();
     await env.DB.batch([
       env.DB.prepare("UPDATE published_stories SET publication_state = 'queued', last_error = NULL, updated_at = ? WHERE publish_key = ? AND publication_state <> 'published'").bind(timestamp, row.publish_key),
