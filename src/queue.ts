@@ -15,9 +15,19 @@ export interface RawPostJob {
   rawPostId: number;
 }
 
+export interface AnalysisBatchJob {
+  kind: "analysis_batch";
+  rawPostIds: number[];
+}
+
 export interface EditorialJob {
   kind: "editorial_candidate";
   candidate: EditorialCandidate;
+}
+
+export interface EditorialBatchJob {
+  kind: "editorial_batch";
+  candidates: EditorialCandidate[];
 }
 
 export interface PublishQueueJob {
@@ -25,10 +35,23 @@ export interface PublishQueueJob {
   job: PublishJob;
 }
 
-export type QueueJob = PollCycleJob | RawIngestJob | RawPostJob | EditorialJob | PublishQueueJob;
+export type QueueJob =
+  | PollCycleJob
+  | RawIngestJob
+  | RawPostJob
+  | AnalysisBatchJob
+  | EditorialJob
+  | EditorialBatchJob
+  | PublishQueueJob;
 
 export function isQueueJob(value: unknown): value is QueueJob {
   if (typeof value !== "object" || value === null || !("kind" in value)) return false;
   const kind = (value as { kind?: unknown }).kind;
-  return kind === "poll_cycle" || kind === "raw_ingest" || kind === "raw_post" || kind === "editorial_candidate" || kind === "publish";
+  return kind === "poll_cycle"
+    || kind === "raw_ingest"
+    || kind === "raw_post"
+    || kind === "analysis_batch"
+    || kind === "editorial_candidate"
+    || kind === "editorial_batch"
+    || kind === "publish";
 }
