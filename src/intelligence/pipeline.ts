@@ -128,9 +128,11 @@ async function findNearDuplicate(
   let best: { id: number; score: number; method: string } | null = null;
   for (const candidate of recent) {
     if (candidate.id === rawPost.id || candidate.source_id === rawPost.source_id) continue;
-    const lexical = combinedSimilarity(text, candidate.normalized_text || candidate.original_text, temporalProximity(rawPost.published_at, candidate.published_at));
+    const candidateText = candidate.normalized_text || candidate.original_text;
+    const temporal = temporalProximity(rawPost.published_at, candidate.published_at);
+    const lexical = combinedSimilarity(text, candidateText, temporal);
     const semantic = semanticById.get(candidate.id) ?? 0;
-    const score = Math.max(lexical, semanticEventScore(semantic, lexicalOverlap(text, candidate.normalized_text || candidate.original_text), temporalProximity(rawPost.published_at, candidate.published_at)));
+    const score = Math.max(lexical, semanticEventScore(semantic, text, candidateText, temporal));
     if (score >= 0.84 && (!best || score > best.score)) {
       best = { id: candidate.id, score, method: semantic > lexical ? "semantic_lexical_temporal" : "lexical_temporal" };
     }
@@ -151,9 +153,10 @@ async function findOrCreateEvent(
   const semanticEventScores = await semanticScoresByEvent(env.DB, semanticNeighbors);
   let best: { event: EventRow; score: number } | null = null;
   for (const candidate of candidates.results) {
-    const lexical = combinedSimilarity(text, candidate.core_fact, temporalProximity(rawPost.published_at, candidate.first_seen_at));
+    const temporal = temporalProximity(rawPost.published_at, candidate.first_seen_at);
+    const lexical = combinedSimilarity(text, candidate.core_fact, temporal);
     const semantic = semanticEventScores.get(candidate.id) ?? 0;
-    const score = Math.max(lexical, semanticEventScore(semantic, lexicalOverlap(text, candidate.core_fact), temporalProximity(rawPost.published_at, candidate.first_seen_at)));
+    const score = Math.max(lexical, semanticEventScore(semantic, text, candidate.core_fact, temporal));
     if (inferCategory(text) !== candidate.category && score < 0.72) continue;
     if (score >= 0.62 && (!best || score > best.score)) best = { event: candidate, score };
   }
