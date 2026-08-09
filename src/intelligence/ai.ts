@@ -2,11 +2,6 @@ import { runtimeConfig } from "../config";
 import { reserveAiCall } from "../db";
 import type { JsonObject } from "../types";
 
-interface AiTextResult {
-  response?: string;
-  result?: unknown;
-}
-
 export async function generateEmbedding(env: Env, text: string): Promise<number[] | null> {
   const config = runtimeConfig(env);
   const allowed = await reserveAiCall(env.DB, "embedding", config.maxEmbeddingsPerDay, 12, config.aiDailyNeuronBudget);
@@ -30,15 +25,14 @@ export async function generateStructuredText(env: Env, prompt: string, stage: "s
   try {
     const result = await env.AI.run(config.textModel, {
       messages: [
-        { role: "system", content: "Return only valid JSON. Do not invent facts." },
+        { role: "system", content: "Return one valid JSON object only. Do not use Markdown fences. Do not invent facts." },
         { role: "user", content: prompt.slice(0, 8_000) }
       ],
+      response_format: { type: "json_object" },
+      temperature: 0.1,
       max_tokens: 600
     });
-    const text = extractText(result);
-    if (!text) return null;
-    const parsed: unknown = JSON.parse(text);
-    return isJsonObject(parsed) ? parsed : null;
+    return parseStructuredAiResult(result);
   } catch (error) {
     console.error(JSON.stringify({ event: "ai_structured_text_failed", stage, error: error instanceof Error ? error.message : "unknown" }));
     return null;
@@ -66,9 +60,7 @@ export async function generateImage(env: Env, prompt: string): Promise<ArrayBuff
         contentType
       }
     });
-    if (isJsonObject(result) && typeof result.image === "string") {
-      return decodeBase64Image(result.image);
-    }
+    if (isJsonObject(result) && typeof result.image === "string") return decodeBase64Image(result.image);
     if (result instanceof ArrayBuffer) return isTelegramImage(result) ? result : null;
     if (result instanceof Uint8Array) {
       const copy = new Uint8Array(result.byteLength);
@@ -87,12 +79,45 @@ export async function generateImage(env: Env, prompt: string): Promise<ArrayBuff
   }
 }
 
-function extractText(value: unknown): string | null {
+export function parseStructuredAiResult(value: unknown): JsonObject | null {
   if (!isJsonObject(value)) return null;
+
+  if (isJsonObject(value.response)) return value.response;
+  if (isJsonObject(value.result)) return value.result;
+  if (isJsonObject(value.result) && isJsonObject(value.result.response)) return value.result.response;
+
+  const text = extractText(value);
+  if (!text) return null;
+  const cleaned = stripMarkdownFence(text).trim();
+  const direct = tryParseJson(cleaned);
+  if (direct) return direct;
+
+  const firstBrace = cleaned.indexOf("{");
+  const lastBrace = cleaned.lastIndexOf("}");
+  if (firstBrace >= 0 && lastBrace > firstBrace) return tryParseJson(cleaned.slice(firstBrace, lastBrace + 1));
+  return null;
+}
+
+function extractText(value: JsonObject): string | null {
   if (typeof value.response === "string") return value.response;
   if (typeof value.result === "string") return value.result;
   if (isJsonObject(value.result) && typeof value.result.response === "string") return value.result.response;
   return null;
+}
+
+function stripMarkdownFence(value: string): string {
+  return value
+    .replace(/^\s*```(?:json)?\s*/iu, "")
+    .replace(/\s*```\s*$/u, "");
+}
+
+function tryParseJson(value: string): JsonObject | null {
+  try {
+    const parsed: unknown = JSON.parse(value);
+    return isJsonObject(parsed) ? parsed : null;
+  } catch {
+    return null;
+  }
 }
 
 function isJsonObject(value: unknown): value is JsonObject {
