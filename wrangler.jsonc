@@ -10,7 +10,7 @@
     "RADAR_DESTINATION_CHAT_ID": "-1004496469105",
     "RADAR_DESTINATION_URL": "https://t.me/RadarKhabarOnline",
     "PUBLISH_ENABLED": "false",
-    "POLL_BATCH_SIZE": "6",
+    "POLL_BATCH_SIZE": "8",
     "POLL_INTERVAL_SECONDS": "180",
     "MAX_HTML_BYTES": "524288",
     "AI_EMBEDDING_MODEL": "@cf/baai/bge-m3",
@@ -36,6 +36,7 @@
   ],
   "queues": {
     "producers": [
+      { "binding": "POLL_QUEUE", "queue": "radar-poll" },
       { "binding": "RAW_INGEST_QUEUE", "queue": "radar-raw-ingest" },
       { "binding": "EVENT_ANALYSIS_QUEUE", "queue": "radar-event-analysis" },
       { "binding": "EDITORIAL_QUEUE", "queue": "radar-editorial" },
@@ -43,6 +44,14 @@
       { "binding": "DEAD_LETTER_QUEUE", "queue": "radar-dead-letter" }
     ],
     "consumers": [
+      {
+        "queue": "radar-poll",
+        "max_batch_size": 1,
+        "max_batch_timeout": 1,
+        "max_retries": 3,
+        "dead_letter_queue": "radar-dead-letter",
+        "max_concurrency": 1
+      },
       { "queue": "radar-raw-ingest", "max_batch_size": 10, "max_batch_timeout": 10 },
       { "queue": "radar-event-analysis", "max_batch_size": 5, "max_batch_timeout": 10 },
       { "queue": "radar-editorial", "max_batch_size": 5, "max_batch_timeout": 10 },
