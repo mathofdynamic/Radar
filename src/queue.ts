@@ -1,5 +1,10 @@
 import type { EditorialCandidate, PublishJob, TelegramWebPollEnvelope } from "./types";
 
+export interface PollCycleJob {
+  kind: "poll_cycle";
+  scheduledAt: string;
+}
+
 export interface RawIngestJob {
   kind: "raw_ingest";
   envelope: TelegramWebPollEnvelope;
@@ -20,10 +25,10 @@ export interface PublishQueueJob {
   job: PublishJob;
 }
 
-export type QueueJob = RawIngestJob | RawPostJob | EditorialJob | PublishQueueJob;
+export type QueueJob = PollCycleJob | RawIngestJob | RawPostJob | EditorialJob | PublishQueueJob;
 
 export function isQueueJob(value: unknown): value is QueueJob {
   if (typeof value !== "object" || value === null || !("kind" in value)) return false;
   const kind = (value as { kind?: unknown }).kind;
-  return kind === "raw_ingest" || kind === "raw_post" || kind === "editorial_candidate" || kind === "publish";
+  return kind === "poll_cycle" || kind === "raw_ingest" || kind === "raw_post" || kind === "editorial_candidate" || kind === "publish";
 }
