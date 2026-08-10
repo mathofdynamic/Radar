@@ -2,6 +2,8 @@ import { aiEditorialOutputSchema } from "../contracts";
 import { generateStructuredText } from "../intelligence/ai";
 import type { EventRow, ScoreResult } from "../types";
 
+export const AI_EDITOR_MIN_SCORE = 75;
+
 export interface EditorialJudgment {
   usedAi: boolean;
   recommendation: "PUBLISH" | "MONITOR" | "IGNORE";
@@ -10,7 +12,21 @@ export interface EditorialJudgment {
   isBreakingCandidate: boolean;
 }
 
+export function shouldUseAiEditor(deterministicScore: number): boolean {
+  return deterministicScore >= AI_EDITOR_MIN_SCORE;
+}
+
 export async function judgeEvent(env: Env, event: EventRow, deterministic: ScoreResult): Promise<EditorialJudgment> {
+  if (!shouldUseAiEditor(deterministic.finalScore)) {
+    return {
+      usedAi: false,
+      recommendation: deterministic.finalScore >= 60 ? "MONITOR" : "IGNORE",
+      adjustedScore: deterministic.finalScore,
+      reason: "below_ai_editor_gate",
+      isBreakingCandidate: false
+    };
+  }
+
   const evidence = await env.DB.prepare(
     `SELECT s.name, s.role, s.priority_tier, s.trust_score, rp.normalized_text
        FROM event_sources es
