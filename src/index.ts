@@ -23,11 +23,13 @@ import type {
   PublishQueueJob,
   QueueJob,
   RawIngestJob,
-  RawPostJob
+  RawPostJob,
+  ResumePublishingJob
 } from "./queue";
 
 const ANALYSIS_ITEMS_PER_JOB = 2;
 const EDITORIAL_ITEMS_PER_JOB = 2;
+const PUBLISH_RESUME_ITEMS_PER_JOB = 2;
 
 interface PublishedEventState {
   publish_key: string;
@@ -35,6 +37,16 @@ interface PublishedEventState {
   telegram_message_id: number | null;
   verification_status: VerificationStatus;
   independent_confirmations: number;
+}
+
+interface PendingPublicationRow {
+  event_id: number;
+  event_version: number;
+  importance_score: number;
+  pending_publish_key: string | null;
+  published_publish_key: string | null;
+  published_event_version: number | null;
+  published_telegram_message_id: number | null;
 }
 
 const DASHBOARD_PAGE_PATHS = new Set([
@@ -67,7 +79,7 @@ export default {
           if (typeof body?.enabled !== "boolean") return Response.json({ error: "invalid_enabled" }, { status: 400 });
           await setRuntimeSetting(env.DB, "publishing_enabled", body.enabled ? "true" : "false");
           await safeIncrementCounter(env.DB, body.enabled ? "publishing_enabled" : "publishing_disabled");
-          const queued = body.enabled ? (await requeuePending(env)).queued : 0;
+          const queued = body.enabled ? (await schedulePublishingResume(env, "publishing_enabled")).queued : 0;
           return Response.json({ ok: true, publishingEnabled: body.enabled, queued });
         }
         if (request.method === "POST" && url.pathname === "/admin/api/actions/validate-sources") return Response.json(await validateSources(env));
@@ -143,6 +155,7 @@ async function dispatchQueueJob(queue: string, body: QueueJob, env: Env): Promis
   if (queue === "radar-event-analysis" && body.kind === "raw_post") return processAnalysis(env, body);
   if (queue === "radar-editorial" && body.kind === "editorial_batch") return processEditorialBatch(env, body);
   if (queue === "radar-editorial" && body.kind === "editorial_candidate") return processEditorial(env, body);
+  if (queue === "radar-publish" && body.kind === "resume_publishing") return processResumePublishing(env, body);
   if (queue === "radar-publish" && body.kind === "publish") return processPublish(env, body);
   throw new Error(`queue_job_mismatch:${queue}:${body.kind}`);
 }
@@ -282,8 +295,11 @@ async function processEditorial(env: Env, job: EditorialJob): Promise<void> {
       .bind(score.finalScore, JSON.stringify({ ...score, ai_editor: judgment }), new Date().toISOString(), event.id)
   ]);
 
+  // Publishing disabled means editorial analysis continues, but final story LLM
+  // generation, cover generation and Telegram work stop here.
+  if (!publishingEnabled) return;
+
   if (materialUpdate && existingPublished?.telegram_message_id) {
-    if (!publishingEnabled) return;
     const story = await buildStoryForPublish(env, event.id, event.event_version, reasons, "update_pending");
     if (!story) return;
     const editJob: PublishJob = {
@@ -308,7 +324,53 @@ async function processEditorial(env: Env, job: EditorialJob): Promise<void> {
     story,
     mode: "publish"
   };
-  if (publishingEnabled) await env.PUBLISH_QUEUE.send({ kind: "publish", job: publishJob } satisfies PublishQueueJob);
+  await env.PUBLISH_QUEUE.send({ kind: "publish", job: publishJob } satisfies PublishQueueJob);
+}
+
+async function processResumePublishing(env: Env, job: ResumePublishingJob): Promise<void> {
+  if (!(await isPublishingEnabled(env.DB, String(env.PUBLISH_ENABLED) === "true"))) return;
+
+  const rows = await listPendingPublications(env, PUBLISH_RESUME_ITEMS_PER_JOB);
+  let queued = 0;
+
+  for (const row of rows) {
+    const story = await buildStoryForPublish(env, row.event_id, row.event_version, [`publishing_resume:${job.reason}`], "pending");
+    if (!story) continue;
+
+    const isEdit = row.published_publish_key != null
+      && row.published_event_version != null
+      && row.published_event_version < row.event_version
+      && row.published_telegram_message_id != null;
+    const publishKey = isEdit
+      ? row.published_publish_key as string
+      : row.pending_publish_key ?? `event:${row.event_id}:version:${row.event_version}`;
+
+    await env.PUBLISH_QUEUE.send({
+      kind: "publish",
+      job: {
+        eventId: row.event_id,
+        eventVersion: row.event_version,
+        publishKey,
+        story,
+        mode: isEdit ? "edit" : "publish",
+        ...(isEdit ? { telegramMessageId: row.published_telegram_message_id as number } : {})
+      }
+    } satisfies PublishQueueJob);
+
+    const timestamp = new Date().toISOString();
+    await env.DB.batch([
+      env.DB.prepare("UPDATE published_stories SET publication_state = 'queued', last_error = NULL, updated_at = ? WHERE publish_key = ? AND publication_state <> 'published'")
+        .bind(timestamp, publishKey),
+      env.DB.prepare("UPDATE editorial_candidates SET status = 'queued', updated_at = ? WHERE event_id = ? AND event_version = ?")
+        .bind(timestamp, row.event_id, row.event_version)
+    ]);
+    queued += 1;
+  }
+
+  if (queued > 0) await safeIncrementCounter(env.DB, "publishing_resume_items_queued", queued);
+  if (rows.length === PUBLISH_RESUME_ITEMS_PER_JOB) {
+    await env.PUBLISH_QUEUE.send({ kind: "resume_publishing", reason: "continuation" } satisfies ResumePublishingJob);
+  }
 }
 
 async function processPublish(env: Env, job: PublishQueueJob): Promise<void> {
@@ -410,10 +472,11 @@ async function buildStoryForPublish(
   } catch (error) {
     if (normalizeErrorMessage(error) !== "story_not_persian") throw error;
     const timestamp = new Date().toISOString();
+    const blockedStatus = pendingStatus === "update_pending" ? "update_story_blocked" : "story_blocked";
     await env.DB.prepare("UPDATE editorial_candidates SET status = ?, updated_at = ? WHERE event_id = ? AND event_version = ?")
-      .bind(pendingStatus, timestamp, eventId, eventVersion).run();
+      .bind(blockedStatus, timestamp, eventId, eventVersion).run();
     await safeIncrementCounter(env.DB, "story_language_rejections");
-    console.warn(JSON.stringify({ event: "publish_deferred_non_persian_story", event_id: eventId, event_version: eventVersion }));
+    console.warn(JSON.stringify({ event: "publish_blocked_non_persian_story", event_id: eventId, event_version: eventVersion }));
     return null;
   }
 }
@@ -498,8 +561,8 @@ async function recoverStalePublishJobs(env: Env): Promise<void> {
       WHERE ec.decision = 'PUBLISH'
         AND ps.publication_state IN ('pending', 'failed', 'processing')
         AND ps.updated_at < ?
-      ORDER BY ps.updated_at ASC LIMIT 5`
-  ).bind(cutoff).all<{ event_id: number; event_version: number; publish_key: string }>();
+      ORDER BY ps.updated_at ASC LIMIT ?`
+  ).bind(cutoff, PUBLISH_RESUME_ITEMS_PER_JOB).all<{ event_id: number; event_version: number; publish_key: string }>();
 
   for (const row of rows.results) {
     try {
@@ -574,8 +637,7 @@ async function validateSources(env: Env): Promise<{ activated: string[]; inactiv
   return { activated, inactive };
 }
 
-async function requeuePending(env: Env): Promise<{ queued: number }> {
-  if (!(await isPublishingEnabled(env.DB, String(env.PUBLISH_ENABLED) === "true"))) throw new Error("publishing_disabled");
+async function listPendingPublications(env: Env, limit: number): Promise<PendingPublicationRow[]> {
   const rows = await env.DB.prepare(
     `SELECT ec.event_id, ec.event_version, e.importance_score,
             ps.publish_key AS pending_publish_key,
@@ -585,49 +647,24 @@ async function requeuePending(env: Env): Promise<{ queued: number }> {
        FROM editorial_candidates ec
        JOIN events e ON e.id = ec.event_id
        LEFT JOIN published_stories ps ON ps.event_id = ec.event_id AND ps.event_version = ec.event_version
-      LEFT JOIN published_stories published ON published.event_id = ec.event_id AND published.publication_state = 'published'
+       LEFT JOIN published_stories published ON published.event_id = ec.event_id AND published.publication_state = 'published'
       WHERE ec.decision = 'PUBLISH'
         AND ec.status IN ('pending', 'failed', 'update_pending', 'update_failed')
         AND (ps.id IS NULL OR ps.publication_state IN ('pending', 'failed'))
         AND (published.id IS NULL OR published.event_version < ec.event_version)
-      ORDER BY e.importance_score DESC LIMIT 25`
-  ).all<{
-    event_id: number;
-    event_version: number;
-    importance_score: number;
-    pending_publish_key: string | null;
-    published_publish_key: string | null;
-    published_event_version: number | null;
-    published_telegram_message_id: number | null;
-  }>();
-  let queued = 0;
-  for (const row of rows.results) {
-    const story = await buildStoryForPublish(env, row.event_id, row.event_version, ["requeued_after_publishing_enable"], "pending");
-    if (!story) continue;
-    const isEdit = row.published_publish_key != null
-      && row.published_event_version != null
-      && row.published_event_version < row.event_version
-      && row.published_telegram_message_id != null;
-    const publishKey = isEdit
-      ? row.published_publish_key as string
-      : row.pending_publish_key ?? `event:${row.event_id}:version:${row.event_version}`;
-    await env.PUBLISH_QUEUE.send({
-      kind: "publish",
-      job: {
-        eventId: row.event_id,
-        eventVersion: row.event_version,
-        publishKey,
-        story,
-        mode: isEdit ? "edit" : "publish",
-        ...(isEdit ? { telegramMessageId: row.published_telegram_message_id as number } : {})
-      }
-    } satisfies PublishQueueJob);
-    const timestamp = new Date().toISOString();
-    await env.DB.batch([
-      env.DB.prepare("UPDATE published_stories SET publication_state = 'queued', last_error = NULL, updated_at = ? WHERE publish_key = ? AND publication_state <> 'published'").bind(timestamp, publishKey),
-      env.DB.prepare("UPDATE editorial_candidates SET status = 'queued', updated_at = ? WHERE event_id = ? AND event_version = ?").bind(timestamp, row.event_id, row.event_version)
-    ]);
-    queued += 1;
-  }
-  return { queued };
+      ORDER BY e.importance_score DESC
+      LIMIT ?`
+  ).bind(limit).all<PendingPublicationRow>();
+  return rows.results;
+}
+
+async function schedulePublishingResume(env: Env, reason: ResumePublishingJob["reason"]): Promise<{ queued: number }> {
+  if (!(await isPublishingEnabled(env.DB, String(env.PUBLISH_ENABLED) === "true"))) throw new Error("publishing_disabled");
+  await env.PUBLISH_QUEUE.send({ kind: "resume_publishing", reason } satisfies ResumePublishingJob);
+  await safeIncrementCounter(env.DB, "publishing_resume_jobs_queued");
+  return { queued: 1 };
+}
+
+async function requeuePending(env: Env): Promise<{ queued: number }> {
+  return schedulePublishingResume(env, "manual_requeue");
 }

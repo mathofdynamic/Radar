@@ -35,6 +35,11 @@ export interface PublishQueueJob {
   job: PublishJob;
 }
 
+export interface ResumePublishingJob {
+  kind: "resume_publishing";
+  reason: "publishing_enabled" | "manual_requeue" | "continuation";
+}
+
 export type QueueJob =
   | PollCycleJob
   | RawIngestJob
@@ -42,7 +47,8 @@ export type QueueJob =
   | AnalysisBatchJob
   | EditorialJob
   | EditorialBatchJob
-  | PublishQueueJob;
+  | PublishQueueJob
+  | ResumePublishingJob;
 
 export function isQueueJob(value: unknown): value is QueueJob {
   if (typeof value !== "object" || value === null || !("kind" in value)) return false;
@@ -53,5 +59,6 @@ export function isQueueJob(value: unknown): value is QueueJob {
     || kind === "analysis_batch"
     || kind === "editorial_candidate"
     || kind === "editorial_batch"
-    || kind === "publish";
+    || kind === "publish"
+    || kind === "resume_publishing";
 }

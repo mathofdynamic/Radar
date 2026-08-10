@@ -180,13 +180,27 @@ export async function isPublishingEnabled(db: D1Database, fallback: boolean): Pr
 }
 
 export async function reserveAiCall(db: D1Database, stage: string, maxCalls: number, estimatedNeurons: number, dailyBudget: number): Promise<boolean> {
+  if (estimatedNeurons <= 0 || estimatedNeurons > dailyBudget) return false;
   const date = new Date().toISOString().slice(0, 10);
-  const current = await db.prepare("SELECT calls, estimated_neurons FROM ai_usage WHERE usage_date = ? AND stage = ?")
-    .bind(date, stage).first<{ calls: number; estimated_neurons: number }>();
-  const currentCalls = current?.calls ?? 0;
-  const currentNeurons = current?.estimated_neurons ?? 0;
-  if (currentCalls >= maxCalls || currentNeurons + estimatedNeurons > dailyBudget) return false;
+  const stageUsage = await db.prepare("SELECT calls FROM ai_usage WHERE usage_date = ? AND stage = ?")
+    .bind(date, stage).first<{ calls: number }>();
+  if ((stageUsage?.calls ?? 0) >= maxCalls) return false;
+
   const timestamp = nowIso();
+  const globalReservation = await db.prepare(
+    `INSERT INTO ai_daily_budget(usage_date, estimated_neurons, updated_at)
+     VALUES (?, ?, ?)
+     ON CONFLICT(usage_date) DO UPDATE SET
+       estimated_neurons = ai_daily_budget.estimated_neurons + excluded.estimated_neurons,
+       updated_at = excluded.updated_at
+     WHERE ai_daily_budget.estimated_neurons + excluded.estimated_neurons <= ?`
+  ).bind(date, estimatedNeurons, timestamp, dailyBudget).run();
+
+  if (Number(globalReservation.meta.changes ?? 0) < 1) return false;
+
+  // The global reservation happens first and is intentionally fail-closed. If the
+  // stage accounting write fails afterward, the ledger may overcount slightly,
+  // but it will never undercount and accidentally exceed the daily AI budget.
   await db.prepare(
     `INSERT INTO ai_usage(usage_date, stage, calls, estimated_neurons, updated_at) VALUES (?, ?, 1, ?, ?)
      ON CONFLICT(usage_date, stage) DO UPDATE SET calls = calls + 1, estimated_neurons = estimated_neurons + excluded.estimated_neurons, updated_at = excluded.updated_at`
