@@ -1,5 +1,4 @@
 import type { StoryDraft } from "../types";
-import { createDeterministicCover } from "./covers";
 import type { CoverArtifact } from "./covers";
 
 interface TelegramResponse {
@@ -10,28 +9,46 @@ interface TelegramResponse {
 
 const MAX_PARSED_CAPTION_CHARS = 900;
 
-export async function publishStory(env: Env, story: StoryDraft, cover: CoverArtifact): Promise<number> {
+export interface PublishResult {
+  telegramMessageId: number;
+  cover: CoverArtifact | null;
+}
+
+export async function publishStory(env: Env, story: StoryDraft, cover: CoverArtifact | null): Promise<PublishResult> {
   if (!env.TELEGRAM_BOT_TOKEN) throw new Error("telegram_bot_token_missing");
+  if (!cover) {
+    return {
+      telegramMessageId: await sendMessage(env, story),
+      cover: null
+    };
+  }
   try {
-    return await sendPhoto(env, story, cover);
+    return {
+      telegramMessageId: await sendPhoto(env, story, cover),
+      cover
+    };
   } catch (error) {
-    if (error instanceof Error && error.message.includes("IMAGE_PROCESS_FAILED") && !cover.reference.startsWith("deterministic-png:")) {
-      console.error(JSON.stringify({ event: "telegram_cover_fallback", reason: "image_process_failed", event_id: story.eventId, event_version: story.eventVersion }));
-      return await sendPhoto(env, story, createDeterministicCover(story));
+    if (error instanceof Error && error.message.includes("IMAGE_PROCESS_FAILED")) {
+      console.error(JSON.stringify({ event: "telegram_cover_skipped", reason: "image_process_failed", event_id: story.eventId, event_version: story.eventVersion, action: "publish_text_only" }));
+      return {
+        telegramMessageId: await sendMessage(env, story),
+        cover: null
+      };
     }
     throw error;
   }
 }
 
-export async function editPublishedStory(env: Env, story: StoryDraft, telegramMessageId: number): Promise<void> {
+export async function editPublishedStory(env: Env, story: StoryDraft, telegramMessageId: number, hasPhoto: boolean): Promise<void> {
   if (!env.TELEGRAM_BOT_TOKEN) throw new Error("telegram_bot_token_missing");
   const form = new FormData();
   form.append("chat_id", env.RADAR_DESTINATION_CHAT_ID);
   form.append("message_id", String(telegramMessageId));
-  form.append("caption", formatCaption(story));
+  form.append(hasPhoto ? "caption" : "text", formatCaption(story));
   form.append("parse_mode", "HTML");
   form.append("reply_markup", JSON.stringify(buildReplyMarkup(story)));
-  const response = await fetch(`https://api.telegram.org/bot${env.TELEGRAM_BOT_TOKEN}/editMessageCaption`, { method: "POST", body: form });
+  const method = hasPhoto ? "editMessageCaption" : "editMessageText";
+  const response = await fetch(`https://api.telegram.org/bot${env.TELEGRAM_BOT_TOKEN}/${method}`, { method: "POST", body: form });
   const payload = await response.json() as TelegramResponse;
   if (!response.ok || !payload.ok) throw new Error(`telegram_edit_failed:${payload.description ?? response.status}`);
 }
@@ -43,11 +60,27 @@ async function sendPhoto(env: Env, story: StoryDraft, cover: CoverArtifact): Pro
   form.append("caption", caption);
   form.append("parse_mode", "HTML");
   form.append("reply_markup", JSON.stringify(buildReplyMarkup(story)));
-  form.append("photo", new Blob([cover.bytes], { type: cover.mimeType }), `radar-${story.eventId}-${story.eventVersion}.png`);
+  form.append("photo", new Blob([cover.bytes], { type: cover.mimeType }), `radar-${story.eventId}-${story.eventVersion}.${coverFileExtension(cover.mimeType)}`);
   const response = await fetch(`https://api.telegram.org/bot${env.TELEGRAM_BOT_TOKEN}/sendPhoto`, { method: "POST", body: form });
   const payload = await response.json() as TelegramResponse;
   if (!response.ok || !payload.ok || !payload.result?.message_id) throw new Error(`telegram_publish_failed:${payload.description ?? response.status}`);
   return payload.result.message_id;
+}
+
+async function sendMessage(env: Env, story: StoryDraft): Promise<number> {
+  const form = new FormData();
+  form.append("chat_id", env.RADAR_DESTINATION_CHAT_ID);
+  form.append("text", formatCaption(story));
+  form.append("parse_mode", "HTML");
+  form.append("reply_markup", JSON.stringify(buildReplyMarkup(story)));
+  const response = await fetch(`https://api.telegram.org/bot${env.TELEGRAM_BOT_TOKEN}/sendMessage`, { method: "POST", body: form });
+  const payload = await response.json() as TelegramResponse;
+  if (!response.ok || !payload.ok || !payload.result?.message_id) throw new Error(`telegram_publish_failed:${payload.description ?? response.status}`);
+  return payload.result.message_id;
+}
+
+function coverFileExtension(mimeType: CoverArtifact["mimeType"]): "png" | "jpg" {
+  return mimeType === "image/jpeg" ? "jpg" : "png";
 }
 
 export async function verifyTelegramDestination(env: Env): Promise<{ ok: boolean; description?: string }> {

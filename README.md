@@ -93,7 +93,7 @@ The initial seed is in `seeds/sources.json`. Every candidate must pass a public-
 
 ## Validation
 
-The test suite covers public Telegram parsing, idempotent raw-post updates, normalization, clustering, verification, scoring, story constraints, deterministic cover generation, publication formatting, and update classification. Live Telegram, Workers AI, Vectorize, and Cloudflare Queue behavior require deployment smoke tests and credentials.
+The test suite covers public Telegram parsing, idempotent raw-post updates, normalization, clustering, verification, scoring, story constraints, AI image-format detection, publication formatting, and update classification. Live Telegram, Workers AI, Vectorize, and Cloudflare Queue behavior require deployment smoke tests and credentials.
 
 After deployment, verify both of these separately:
 

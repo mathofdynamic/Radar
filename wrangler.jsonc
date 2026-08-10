@@ -9,7 +9,7 @@
     "ENVIRONMENT": "production",
     "RADAR_DESTINATION_CHAT_ID": "-1004496469105",
     "RADAR_DESTINATION_URL": "https://t.me/RadarKhabarOnline",
-    "PUBLISH_ENABLED": "false",
+    "PUBLISH_ENABLED": "true",
     "POLL_BATCH_SIZE": "3",
     "POLL_INTERVAL_SECONDS": "180",
     "MAX_HTML_BYTES": "524288",

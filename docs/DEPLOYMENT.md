@@ -107,6 +107,6 @@ Open `https://radar-pipeline.<your-workers-subdomain>.workers.dev/admin` and sig
 
 - Queue failures are retried by Cloudflare; inspect `queue_failures` and dead-letter state.
 - Raw posts and events remain in D1 when AI calls fail.
-- Covers are generated in memory with Workers AI when budget allows, or as deterministic branded SVGs, then uploaded directly to Telegram.
+- Covers are generated in memory with Workers AI when available. If generation or Telegram image processing fails, the story is published as a text-only Telegram message.
 - Publishing retries are guarded by `publish_key = event:<id>:version:<version>`.
 - If Telegram accepts a message while the Worker crashes before persistence, reconcile the channel manually before requeueing the candidate.

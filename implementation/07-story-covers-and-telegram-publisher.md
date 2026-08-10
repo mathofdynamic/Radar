@@ -1,6 +1,6 @@
 # Phase 07 — Story Generation, Covers, and Telegram Publisher
 
-> Repository override: R2 is intentionally not used. Generate the Workers AI cover in Worker memory when budget allows, use the deterministic Radar SVG fallback otherwise, and upload the result directly to Telegram. The original R2 persistence requirements below are historical design guidance and are superseded by `Overview/Cloudflare-Free-Adaptation.md`.
+> Repository override: R2 is intentionally not used. Generate the Workers AI cover in Worker memory when available and upload it directly to Telegram. If generation or image processing fails, publish the story as text-only without a fallback graphic. The original R2 persistence requirements below are historical design guidance and are superseded by `Overview/Cloudflare-Free-Adaptation.md`.
 
 ## Coding-Agent Prompt
 

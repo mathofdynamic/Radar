@@ -37,11 +37,10 @@ flowchart TD
     AA --> AB[Persist processing state in D1]
     AB --> AC[Generate FLUX.2 Klein cover if budget allows]
     AC --> AD{AI image valid?}
-    AD -- No --> AE[Generate deterministic branded PNG]
-    AD -- Yes --> AF[Use AI PNG]
-    AE --> AG[Telegram Bot API sendPhoto]
-    AF --> AG
-    AG --> AH{Telegram accepted?}
+    AD -- No --> AE[Telegram Bot API sendMessage]
+    AD -- Yes --> AF[Telegram Bot API sendPhoto]
+    AE --> AH{Telegram accepted?}
+    AF --> AH
     AH -- No --> AI[Record failure and retry Queue job]
     AH -- Yes --> AJ[Persist message ID, cover reference and links]
     AJ --> AK[Published in RadarKhabarOnline]
@@ -189,22 +188,21 @@ The configured image model is:
 @cf/black-forest-labs/flux-2-klein-4b
 ```
 
-The Worker sends the prompt as multipart form data with a `640x360` output size and converts the model's Base64 image response into a PNG buffer.
+The Worker sends the prompt as multipart form data with a `640x360` output size and detects the MIME type of the model's Base64 image response before sending it to Telegram.
 
-If the cover call is denied by the daily budget, the response is invalid, or Telegram rejects the image, Radar uses a deterministic branded PNG generated in memory. This fallback does not require R2.
+If the cover call is denied by the daily budget or the response is invalid, Radar publishes the story without a cover. If Telegram rejects a valid image, Radar sends the same story as a text-only message. No replacement or default graphic is generated.
 
 Cover references make the result visible in D1:
 
 ```text
 ai-generated:events/{event_id}/v{event_version}
-deterministic-png:events/{event_id}/v{event_version}
 ```
 
 Queue retries can re-enter the publishing function. The `publish_key` prevents a story version that was already persisted as `published` from being sent again during normal retries. An event-level publication lock also allows only one live Telegram story per event. New evidence that only increments the event version is retained in D1 and marked as an internal/suppressed update instead of creating another channel post.
 
 ## 8. Telegram publication
 
-The publisher calls the Bot API `sendPhoto` with:
+When an AI cover is available, the publisher calls the Bot API `sendPhoto` with:
 
 - destination chat ID `-1004496469105`;
 - the PNG cover;
@@ -212,13 +210,15 @@ The publisher calls the Bot API `sendPhoto` with:
 - verification status and confirmation count;
 - inline buttons linking to original source posts.
 
+When no cover is available, the publisher calls `sendMessage` with the same Persian HTML story and source buttons.
+
 After Telegram returns a message ID, Radar persists:
 
 - publication state;
 - event ID and version;
 - Telegram message ID;
 - final story fields;
-- cover reference and MIME type;
+- cover reference and MIME type, or null for a text-only publication;
 - source links;
 - publication timestamps.
 
@@ -279,4 +279,4 @@ GET /ops/summary
 - Forward and edit metadata is incomplete.
 - Covers are held in memory and sent directly to Telegram; R2 is not used.
 - AI stages fail closed. Raw evidence and events are preserved when AI is unavailable.
-- A deterministic fallback is preferred to blocking publication when a cover cannot be generated.
+- A cover is optional. Failed generation must not block publication, and no fallback graphic is sent.

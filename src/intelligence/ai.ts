@@ -2,6 +2,13 @@ import { runtimeConfig } from "../config";
 import { reserveAiCall } from "../db";
 import type { JsonObject } from "../types";
 
+export type GeneratedImageMimeType = "image/png" | "image/jpeg";
+
+export interface GeneratedImage {
+  bytes: ArrayBuffer;
+  mimeType: GeneratedImageMimeType;
+}
+
 export async function generateEmbedding(env: Env, text: string): Promise<number[] | null> {
   const config = runtimeConfig(env);
   const allowed = await reserveAiCall(env.DB, "embedding", config.maxEmbeddingsPerDay, 12, config.aiDailyNeuronBudget);
@@ -25,7 +32,7 @@ export async function generateStructuredText(env: Env, prompt: string, stage: "s
   try {
     const result = await env.AI.run(config.textModel, {
       messages: [
-        { role: "system", content: "Return one valid JSON object only. Do not use Markdown fences. Do not invent facts." },
+        { role: "system", content: "You are a Persian-language news editor. Return one valid JSON object only. The title and description must always be written in Persian script. Translate English evidence into Persian; never copy an English sentence. Do not use Markdown fences. Do not invent facts." },
         { role: "user", content: prompt.slice(0, 8_000) }
       ],
       response_format: { type: "json_object" },
@@ -39,7 +46,7 @@ export async function generateStructuredText(env: Env, prompt: string, stage: "s
   }
 }
 
-export async function generateImage(env: Env, prompt: string): Promise<ArrayBuffer | null> {
+export async function generateImage(env: Env, prompt: string): Promise<GeneratedImage | null> {
   const config = runtimeConfig(env);
   const allowed = await reserveAiCall(env.DB, "cover", config.maxCoversPerDay, 500, config.aiDailyNeuronBudget);
   if (!allowed) {
@@ -61,15 +68,15 @@ export async function generateImage(env: Env, prompt: string): Promise<ArrayBuff
       }
     });
     if (isJsonObject(result) && typeof result.image === "string") return decodeBase64Image(result.image);
-    if (result instanceof ArrayBuffer) return isTelegramImage(result) ? result : null;
+    if (result instanceof ArrayBuffer) return identifyImage(result);
     if (result instanceof Uint8Array) {
       const copy = new Uint8Array(result.byteLength);
       copy.set(result);
-      return isTelegramImage(copy.buffer) ? copy.buffer : null;
+      return identifyImage(copy.buffer);
     }
     if (isReadableStream(result)) {
       const bytes = await new Response(result).arrayBuffer();
-      return isTelegramImage(bytes) ? bytes : null;
+      return identifyImage(bytes);
     }
     console.error(JSON.stringify({ event: "ai_image_invalid", model: config.imageModel, reason: "unsupported_response" }));
     return null;
@@ -136,19 +143,30 @@ function isReadableStream(value: unknown): value is ReadableStream<Uint8Array> {
   return typeof value === "object" && value !== null && "getReader" in value && typeof value.getReader === "function";
 }
 
-function decodeBase64Image(value: string): ArrayBuffer | null {
+function decodeBase64Image(value: string): GeneratedImage | null {
   const encoded = value.includes(",") ? value.slice(value.indexOf(",") + 1) : value;
   try {
     const binary = atob(encoded.replace(/\s+/gu, ""));
     const bytes = new Uint8Array(binary.length);
     for (let index = 0; index < binary.length; index += 1) bytes[index] = binary.charCodeAt(index);
-    return isTelegramImage(bytes.buffer) ? bytes.buffer : null;
+    return identifyImage(bytes.buffer);
   } catch {
     return null;
   }
 }
 
-function isTelegramImage(bytes: ArrayBuffer): boolean {
+function identifyImage(bytes: ArrayBuffer): GeneratedImage | null {
+  const mimeType = detectImageMimeType(bytes);
+  return mimeType ? { bytes, mimeType } : null;
+}
+
+export function detectImageMimeType(bytes: ArrayBuffer): GeneratedImageMimeType | null {
   const header = new Uint8Array(bytes, 0, Math.min(bytes.byteLength, 12));
-  return header.length >= 8 && header[0] === 137 && header[1] === 80 && header[2] === 78 && header[3] === 71 && header[4] === 13 && header[5] === 10 && header[6] === 26 && header[7] === 10;
+  const isPng = header.length >= 8 && header[0] === 137 && header[1] === 80 && header[2] === 78 && header[3] === 71 && header[4] === 13 && header[5] === 10 && header[6] === 26 && header[7] === 10;
+  if (isPng) return "image/png";
+
+  const isJpeg = header.length >= 3 && header[0] === 255 && header[1] === 216 && header[2] === 255;
+  if (isJpeg) return "image/jpeg";
+
+  return null;
 }

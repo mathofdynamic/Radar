@@ -1,5 +1,6 @@
 import { timingSafeStringEqual } from "./crypto";
 import { isDashboardSession } from "./auth";
+import { isPublishingEnabled } from "./db";
 
 export async function isAdminRequest(request: Request, env: Env): Promise<boolean> {
   const expected = env.RADAR_ADMIN_KEY;
@@ -21,7 +22,7 @@ export async function healthResponse(env: Env): Promise<Response> {
     ok: true,
     service: "radar-pipeline",
     environment: env.ENVIRONMENT,
-    publishing_enabled: String(env.PUBLISH_ENABLED) === "true",
+    publishing_enabled: await isPublishingEnabled(env.DB, String(env.PUBLISH_ENABLED) === "true"),
     destination: env.RADAR_DESTINATION_URL,
     sources: { total: sources?.total ?? 0, active: sources?.active ?? 0 },
     metrics: Object.fromEntries(metrics.results.map((row) => [row.metric, row.value])),

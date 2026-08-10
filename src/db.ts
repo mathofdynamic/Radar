@@ -160,6 +160,25 @@ export async function incrementCounter(db: D1Database, metric: string, amount = 
   ).bind(date, metric, amount, timestamp).run();
 }
 
+export async function getRuntimeSetting(db: D1Database, key: string): Promise<string | null> {
+  const row = await db.prepare(
+    "SELECT setting_value FROM runtime_settings WHERE setting_key = ?"
+  ).bind(key).first<{ setting_value: string }>();
+  return row?.setting_value ?? null;
+}
+
+export async function setRuntimeSetting(db: D1Database, key: string, value: string): Promise<void> {
+  await db.prepare(
+    `INSERT INTO runtime_settings(setting_key, setting_value, updated_at) VALUES (?, ?, ?)
+     ON CONFLICT(setting_key) DO UPDATE SET setting_value = excluded.setting_value, updated_at = excluded.updated_at`
+  ).bind(key, value, nowIso()).run();
+}
+
+export async function isPublishingEnabled(db: D1Database, fallback: boolean): Promise<boolean> {
+  const value = await getRuntimeSetting(db, "publishing_enabled");
+  return value == null ? fallback : value === "true";
+}
+
 export async function reserveAiCall(db: D1Database, stage: string, maxCalls: number, estimatedNeurons: number, dailyBudget: number): Promise<boolean> {
   const date = new Date().toISOString().slice(0, 10);
   const current = await db.prepare("SELECT calls, estimated_neurons FROM ai_usage WHERE usage_date = ? AND stage = ?")

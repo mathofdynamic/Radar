@@ -1,3 +1,5 @@
+import { isPublishingEnabled } from "./db";
+
 interface DashboardSource {
   id: number;
   sourceKey: string;
@@ -204,7 +206,7 @@ interface AiQueryRow {
 export async function dashboardSnapshot(env: Env): Promise<DashboardSnapshot> {
   const now = new Date();
   const today = now.toISOString().slice(0, 10);
-  const [sourceResult, postResult, eventResult, storyResult, candidateResult, counterResult, aiResult] = await Promise.all([
+  const [sourceResult, postResult, eventResult, storyResult, candidateResult, counterResult, aiResult, publishingEnabled] = await Promise.all([
     env.DB.prepare(
       `SELECT id, source_key, name, telegram_username, category, priority_tier, is_active,
               health_status, last_polled_at, next_poll_at, last_seen_message_id, last_error
@@ -238,7 +240,8 @@ export async function dashboardSnapshot(env: Env): Promise<DashboardSnapshot> {
     ).bind(today).all<CounterQueryRow>(),
     env.DB.prepare(
       "SELECT stage, calls, estimated_neurons FROM ai_usage WHERE usage_date = ? ORDER BY stage"
-    ).bind(today).all<AiQueryRow>()
+    ).bind(today).all<AiQueryRow>(),
+    isPublishingEnabled(env.DB, String(env.PUBLISH_ENABLED) === "true")
   ]);
 
   const counters = counterResult.results;
@@ -328,7 +331,7 @@ export async function dashboardSnapshot(env: Env): Promise<DashboardSnapshot> {
       environment: env.ENVIRONMENT,
       destinationUrl: env.RADAR_DESTINATION_URL,
       destinationChatId: env.RADAR_DESTINATION_CHAT_ID,
-      publishingEnabled: String(env.PUBLISH_ENABLED) === "true",
+      publishingEnabled,
       today
     },
     overview: {

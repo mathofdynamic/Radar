@@ -17,7 +17,15 @@ export async function buildStoryDraft(env: Env, eventId: number, eventVersion: n
   const primarySources = sourceRows.slice(0, 3).map((source) => ({ name: source.name, url: source.canonical_url }));
   const tags = await loadTags(env.DB, eventId);
   const prompt = JSON.stringify({
-    task: "Write a concise Persian news story from evidence. Return JSON only. The title must be one line, concise, and must not include source handles or media emojis. The description must add context without repeating the title and must not include status or confirmation labels.",
+    task: "Write a concise Persian news story from evidence. Return JSON only.",
+    language: "fa-IR",
+    hard_language_rules: [
+      "عنوان و توضیح باید همیشه به فارسی معیار و با خط فارسی نوشته شوند.",
+      "اگر شواهد یا منابع انگلیسی هستند، واقعیت‌ها را به فارسی ترجمه کن و متن انگلیسی را کپی نکن.",
+      "در عنوان و توضیح هیچ جملهٔ انگلیسی ننویس؛ نام‌های خاص و مخفف‌های ضروری لاتین مجازند.",
+      "عنوان یک خط، کوتاه و بدون نام کاربری منبع یا ایموجی رسانه باشد.",
+      "توضیح باید زمینهٔ خبر را بدون تکرار عنوان اضافه کند و نباید برچسب وضعیت یا تأیید را داخل خود متن بیاورد."
+    ],
     core_fact: event.core_fact,
     verification_status: event.verification_status,
     independent_confirmations: event.independent_confirmation_count,
@@ -41,10 +49,14 @@ export async function buildStoryDraft(env: Env, eventId: number, eventVersion: n
       links,
       coverConcept: typeof aiResult.cover_concept === "string" ? aiResult.cover_concept : `${event.category} editorial illustration`
     });
-    if (candidate.success) return candidate.data;
-    console.error(JSON.stringify({ event: "story_schema_invalid", event_id: eventId, issues: candidate.error.issues }));
+    if (candidate.success) {
+      if (isPersianStory(candidate.data)) return candidate.data;
+      console.warn(JSON.stringify({ event: "story_language_rejected", event_id: eventId, event_version: eventVersion, source: "ai" }));
+    } else {
+      console.error(JSON.stringify({ event: "story_schema_invalid", event_id: eventId, issues: candidate.error.issues }));
+    }
   }
-  return storyDraftSchema.parse({
+  const fallback = storyDraftSchema.parse({
     eventId,
     eventVersion,
     title: fallbackTitle(event),
@@ -57,6 +69,21 @@ export async function buildStoryDraft(env: Env, eventId: number, eventVersion: n
     links,
     coverConcept: `${event.category} symbolic editorial illustration for Radar`
   });
+  if (!isPersianStory(fallback)) {
+    console.warn(JSON.stringify({ event: "story_language_rejected", event_id: eventId, event_version: eventVersion, source: "fallback" }));
+    throw new Error("story_not_persian");
+  }
+  return fallback;
+}
+
+export function isPersianStory(story: Pick<StoryDraft, "title" | "description">): boolean {
+  return hasPersianSignal(story.title) && hasPersianSignal(story.description);
+}
+
+function hasPersianSignal(value: string): boolean {
+  const persianLetters = value.match(/[\u0600-\u06ff]/gu) ?? [];
+  const latinLetters = value.match(/[A-Za-z]/gu) ?? [];
+  return persianLetters.length >= 5 && persianLetters.length >= latinLetters.length;
 }
 
 async function loadTags(db: D1Database, eventId: number): Promise<string[]> {
