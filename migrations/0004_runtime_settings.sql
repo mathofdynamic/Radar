@@ -5,5 +5,5 @@ CREATE TABLE IF NOT EXISTS runtime_settings (
 );
 
 INSERT INTO runtime_settings(setting_key, setting_value, updated_at)
-VALUES ('publishing_enabled', 'true', datetime('now'))
+VALUES ('publishing_enabled', 'false', datetime('now'))
 ON CONFLICT(setting_key) DO NOTHING;
