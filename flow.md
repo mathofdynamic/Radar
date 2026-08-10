@@ -9,7 +9,7 @@ Radar is a Cloudflare-only polling pipeline. It does not use Telethon, a Telegra
 ```mermaid
 flowchart TD
     A[Cloudflare Cron every minute] --> B[Select due sources from D1]
-    B --> C[Poll up to two public Telegram pages]
+    B --> C[Poll up to five due public Telegram pages]
     C --> D{Fetch and parse successful?}
     D -- No --> E[Mark source degraded and record failure]
     D -- Yes --> F[Extract posts and content hashes]
@@ -55,10 +55,10 @@ On each invocation it:
 1. Seeds the source registry if the database is empty.
 2. Recovers stale publishing jobs older than ten minutes.
 3. Selects due sources from D1.
-4. Polls at most two sources per run.
+4. Polls at most five due sources per run.
 5. Sends every new or edited envelope to `radar-raw-ingest`.
 
-With the current fifteen-minute source interval and two-source batch size, each active source is normally checked about every fifteen minutes.
+The polling calibration runs every minute with a five-source batch and a 300-second source interval. With 23 active sources, it targets approximately a five-minute revisit interval while staying within the Worker per-invocation limit.
 
 The poller requests:
 

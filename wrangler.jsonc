@@ -10,8 +10,8 @@
     "RADAR_DESTINATION_CHAT_ID": "-1004496469105",
     "RADAR_DESTINATION_URL": "https://t.me/RadarKhabarOnline",
     "PUBLISH_ENABLED": "false",
-    "POLL_BATCH_SIZE": "3",
-    "POLL_INTERVAL_SECONDS": "180",
+    "POLL_BATCH_SIZE": "5",
+    "POLL_INTERVAL_SECONDS": "300",
     "MAX_HTML_BYTES": "524288",
     "AI_EMBEDDING_MODEL": "@cf/baai/bge-m3",
     "AI_TEXT_MODEL": "@cf/meta/llama-3.1-8b-instruct-fast",
@@ -90,7 +90,7 @@
     { "binding": "EVENT_INDEX", "index_name": "radar-events" }
   ],
   "triggers": {
-    "crons": ["*/2 * * * *"]
+    "crons": ["* * * * *"]
   },
   "observability": {
     "enabled": true,

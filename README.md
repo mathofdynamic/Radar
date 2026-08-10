@@ -85,6 +85,8 @@ Publishing is disabled by default in new environments. Set `PUBLISH_ENABLED` to 
 
 With a one-minute Cron, `radar-poll` receives at most 1,440 normal poll-cycle messages per UTC day. A successfully delivered Queue message normally incurs write + read + delete operations, so the scheduler consumes roughly 4,320 Queue operations/day before retries. This leaves headroom under the Free Queues daily allowance for publication jobs and rare fallback-stage retries.
 
+The V5 polling capacity is calibrated for freshness: five due sources per minute provide approximately 300 source polls/hour. With 23 active sources and a five-minute target interval, the expected demand is approximately 276 polls/hour. This intentionally balances source freshness against Cloudflare Free per-invocation limits without increasing Queue consumer concurrency.
+
 Do not change the architecture to enqueue one polling message per source every few minutes: with 20+ sources that can exceed the Free Queues operation allowance even before news-processing messages are counted.
 
 ## Source registry
