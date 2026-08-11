@@ -24,7 +24,7 @@ import { generateEmbedding } from "./ai";
 import { calculateVerification, classifyOrigin, originGroupFor, persistVerification } from "./verification";
 import { scoreEvent } from "../editorial/scoring";
 import type { EditorialCandidate, EventRow, RawPostRow, SourceRow, TelegramWebPollEnvelope } from "../types";
-import { ANALYSIS_STALE_AFTER_MS, isReusableEmbeddingCheckpoint, isStaleAnalysisLease, parseEmbedding, shouldSkipAnalyzedPost } from "./analysis-state";
+import { ANALYSIS_STALE_AFTER_MS, isDeferredCheckpointForCurrentUtcDate, isReusableEmbeddingCheckpoint, isStaleAnalysisLease, parseEmbedding, shouldSkipAnalyzedPost } from "./analysis-state";
 
 interface SemanticNeighbor {
   rawPostId: number;
@@ -96,6 +96,7 @@ export async function prepareRawPost(env: Env, rawPostId: number): Promise<void>
   const contentHash = await sha256Hex(normalized.normalizedText);
   const config = runtimeConfig(env);
   const embeddingModel = config.embeddingModel;
+  const now = new Date().toISOString();
 
   if (shouldSkipAnalyzedPost(rawPost.processing_status)) return;
 
@@ -129,6 +130,18 @@ export async function prepareRawPost(env: Env, rawPostId: number): Promise<void>
     return;
   }
 
+  if (isDeferredCheckpointForCurrentUtcDate(existing, contentHash, embeddingModel, now)) {
+    // Do not reserve or call Workers AI again during the same UTC day. If a
+    // finalization job failed, stale recovery can still resume lexical/event
+    // analysis through the existing checkpoint without creating AI churn.
+    if (rawPost.processing_status === "embedding"
+      || rawPost.processing_status === "analyzing"
+      || rawPost.processing_status === "embedded") return;
+    await markEmbedded(env, rawPost.id, contentHash);
+    await queueAnalysisFinalize(env, rawPost.id);
+    return;
+  }
+
   if (rawPost.processing_status === "embedded"
     || (rawPost.processing_status === "analyzing" && isStaleAnalysisLease(rawPost.analysis_lease_at, new Date().toISOString()))) {
     await env.DB.prepare(
@@ -147,6 +160,12 @@ export async function prepareRawPost(env: Env, rawPostId: number): Promise<void>
   // lookup and the lease update. Check again before reserving AI budget.
   const checkpointAfterClaim = await getEmbeddingCheckpoint(env.DB, rawPost.id, contentHash, embeddingModel);
   if (isReusableEmbeddingCheckpoint(checkpointAfterClaim, contentHash, embeddingModel)) {
+    await markEmbedded(env, rawPost.id, contentHash);
+    await queueAnalysisFinalize(env, rawPost.id);
+    return;
+  }
+
+  if (isDeferredCheckpointForCurrentUtcDate(checkpointAfterClaim, contentHash, embeddingModel, new Date().toISOString())) {
     await markEmbedded(env, rawPost.id, contentHash);
     await queueAnalysisFinalize(env, rawPost.id);
     return;
