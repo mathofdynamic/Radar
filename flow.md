@@ -18,32 +18,37 @@ flowchart TD
     G -- Yes --> I[Create polling envelope]
     I --> J[radar-raw-ingest]
     J --> K[Persist raw post in D1]
-    K --> L[radar-event-analysis]
+    K --> L[radar-event-analysis: analysis_prepare]
     L --> M[Normalize Persian/Arabic text]
     M --> N{Noise or deleted?}
     N -- Yes --> O[Mark filtered]
-    N -- No --> P[Generate embedding if budget allows]
-    P --> Q[Search Vectorize and run lexical/entity/time duplicate checks]
-    Q --> R{Duplicate?}
-    R -- Yes --> S[Record duplicate relationship]
-    R -- No --> T[Create or update event]
-    T --> U[Group origins and calculate verification]
-    U --> V[Calculate importance score]
-    V --> W[radar-editorial]
-    W --> X{Editorial gate passed?}
-    X -- No --> Y[Monitor or ignore; do not publish]
-    X -- Yes --> Z[Build Persian story draft]
-    Z --> AA[radar-publish]
-    AA --> AB[Persist processing state in D1]
-    AB --> AC[Generate FLUX.2 Klein cover if budget allows]
-    AC --> AD{AI image valid?}
-    AD -- No --> AE[Telegram Bot API sendMessage]
-    AD -- Yes --> AF[Telegram Bot API sendPhoto]
-    AE --> AH{Telegram accepted?}
-    AF --> AH
-    AH -- No --> AI[Record failure and retry Queue job]
-    AH -- Yes --> AJ[Persist message ID, cover reference and links]
-    AJ --> AK[Published in RadarKhabarOnline]
+    N -- No --> P{Reusable checkpoint for content hash + model?}
+    P -- No --> Q[Reserve budget, generate embedding, persist checkpoint]
+    P -- Yes --> R[Reuse durable embedding]
+    Q --> S[radar-event-analysis: analysis_finalize]
+    R --> S
+    S --> T[Vectorize and run lexical/entity/time duplicate checks]
+    T --> U{Duplicate?}
+    U -- Yes --> V[Record duplicate relationship]
+    U -- No --> W[Create or update event]
+    V --> X[Group origins and calculate verification]
+    W --> X
+    X --> Y[Calculate importance score]
+    Y --> Z[radar-editorial]
+    Z --> AA{Editorial gate passed?}
+    AA -- No --> AB[Monitor or ignore; do not publish]
+    AA -- Yes --> AC[Build Persian story draft]
+    AC --> AD[radar-publish]
+    AD --> AE[Persist processing state in D1]
+    AE --> AF[Generate FLUX.2 Klein cover if budget allows]
+    AF --> AG{AI image valid?}
+    AG -- No --> AH[Telegram Bot API sendMessage]
+    AG -- Yes --> AI[Telegram Bot API sendPhoto]
+    AH --> AJ{Telegram accepted?}
+    AI --> AJ
+    AJ -- No --> AK[Record failure and retry Queue job]
+    AJ -- Yes --> AL[Persist message ID, cover reference and links]
+    AL --> AM[Published in RadarKhabarOnline]
 ```
 
 ## 1. Scheduled collection
@@ -92,22 +97,32 @@ If the same message has the same content hash, it is ignored. If the hash change
 
 The `radar-raw-ingest` consumer validates the envelope, confirms that the source exists, and persists the original post in D1. Original text and raw evidence are retained before any normalization.
 
-After persistence, it sends a raw-post job to `radar-event-analysis`.
+After persistence, it sends one `analysis_prepare` job to `radar-event-analysis`. The prepare stage owns normalization and embedding only. It writes a D1 checkpoint containing the normalized-text hash, embedding model, and reusable vector before sending `analysis_finalize`.
 
 ## 4. Intelligence and event formation
 
-The analysis consumer performs the following operations:
+The analysis consumer performs two bounded stages. Each job handles one raw post.
 
-1. Deterministic Persian/Arabic normalization, whitespace cleanup, and noise detection.
-2. Noise and deleted-post filtering.
-3. Workers AI embedding generation using `@cf/baai/bge-m3` when the embedding budget permits.
-4. Vectorize upsert and similarity retrieval using the `radar-events` index.
-5. Lexical, entity, and temporal duplicate detection.
-6. Duplicate relationship persistence without deleting the original evidence.
-7. Event creation or assignment.
-8. Event-source attachment and origin-group classification.
-9. Verification recalculation.
-10. Importance-score recalculation.
+### Stage A: prepare and embed
+
+1. Normalize Persian/Arabic text and classify noise or deleted posts.
+2. Calculate a stable hash of the normalized text.
+3. Reuse a matching D1 embedding checkpoint when one exists.
+4. Otherwise reserve the global AI budget, generate one embedding, and persist the checkpoint immediately.
+5. Queue the finalization stage.
+
+### Stage B: analysis finalization
+
+1. Reuse the checkpoint for Vectorize upsert and similarity retrieval using the `radar-events` index.
+2. Lexical, entity, and temporal duplicate detection.
+3. Duplicate relationship persistence without deleting the original evidence.
+4. Event creation or assignment.
+5. Event-source attachment and origin-group classification.
+6. Verification recalculation.
+7. Importance-score recalculation.
+8. Mark the raw post `analyzed` and remove the temporary checkpoint.
+
+Event-source insertion is conflict-safe. A small durable version marker ensures one raw post cannot increment an event version repeatedly when finalization retries. Stale analysis leases older than ten minutes are recovered one row at a time by the poll consumer.
 
 D1 remains the source of truth. Vectorize is only a searchable index and is not authoritative event storage.
 

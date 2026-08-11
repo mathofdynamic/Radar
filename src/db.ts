@@ -1,5 +1,5 @@
 import type { RuntimeConfig } from "./config";
-import type { EventRow, PolledPost, RawPostRow, SourceRow, SourceSeed, TelegramWebPollEnvelope } from "./types";
+import type { EmbeddingCheckpointRow, EventRow, PolledPost, RawPostRow, SourceRow, SourceSeed, TelegramWebPollEnvelope } from "./types";
 
 export function nowIso(): string {
   return new Date().toISOString();
@@ -87,7 +87,34 @@ export async function upsertRawPost(db: D1Database, envelope: TelegramWebPollEnv
       raw_html_snippet = excluded.raw_html_snippet,
       raw_metadata_json = excluded.raw_metadata_json,
       is_deleted = CASE WHEN excluded.update_type = 'delete' THEN 1 ELSE raw_posts.is_deleted END,
-      processing_status = 'pending',
+      processing_status = CASE
+        WHEN raw_posts.content_hash = excluded.content_hash
+         AND raw_posts.is_deleted = 0
+         AND excluded.update_type <> 'delete'
+        THEN raw_posts.processing_status
+        ELSE 'pending'
+      END,
+      analysis_content_hash = CASE
+        WHEN raw_posts.content_hash = excluded.content_hash
+         AND raw_posts.is_deleted = 0
+         AND excluded.update_type <> 'delete'
+        THEN raw_posts.analysis_content_hash
+        ELSE NULL
+      END,
+      analysis_lease_at = CASE
+        WHEN raw_posts.content_hash = excluded.content_hash
+         AND raw_posts.is_deleted = 0
+         AND excluded.update_type <> 'delete'
+        THEN raw_posts.analysis_lease_at
+        ELSE NULL
+      END,
+      analysis_attempts = CASE
+        WHEN raw_posts.content_hash = excluded.content_hash
+         AND raw_posts.is_deleted = 0
+         AND excluded.update_type <> 'delete'
+        THEN raw_posts.analysis_attempts
+        ELSE 0
+      END,
       updated_at = excluded.updated_at`
   ).bind(
     envelope.sourceId,
@@ -228,4 +255,138 @@ export async function recordSourcePostFingerprint(db: D1Database, post: PolledPo
   const row = await db.prepare("SELECT content_hash FROM raw_posts WHERE source_id = ? AND telegram_message_id = ?")
     .bind(post.sourceId, post.messageId).first<{ content_hash: string }>();
   return row?.content_hash === post.contentHash;
+}
+
+export async function getEmbeddingCheckpoint(
+  db: D1Database,
+  rawPostId: number,
+  contentHash: string,
+  embeddingModel: string
+): Promise<EmbeddingCheckpointRow | null> {
+  return db.prepare(
+    `SELECT raw_post_id, content_hash, embedding_model, vector_json, embedding_state, embedded_at, updated_at
+       FROM embedding_checkpoints
+      WHERE raw_post_id = ? AND content_hash = ? AND embedding_model = ?`
+  ).bind(rawPostId, contentHash, embeddingModel).first<EmbeddingCheckpointRow>();
+}
+
+export async function saveEmbeddingCheckpoint(
+  db: D1Database,
+  checkpoint: Omit<EmbeddingCheckpointRow, "updated_at"> & { updated_at?: string }
+): Promise<void> {
+  const updatedAt = checkpoint.updated_at ?? nowIso();
+  await db.prepare(
+    `INSERT INTO embedding_checkpoints(
+       raw_post_id, content_hash, embedding_model, vector_json, embedding_state, embedded_at, updated_at
+     ) VALUES (?, ?, ?, ?, ?, ?, ?)
+     ON CONFLICT(raw_post_id) DO UPDATE SET
+       content_hash = excluded.content_hash,
+       embedding_model = excluded.embedding_model,
+       vector_json = excluded.vector_json,
+       embedding_state = excluded.embedding_state,
+       embedded_at = excluded.embedded_at,
+       updated_at = excluded.updated_at`
+  ).bind(
+    checkpoint.raw_post_id,
+    checkpoint.content_hash,
+    checkpoint.embedding_model,
+    checkpoint.vector_json,
+    checkpoint.embedding_state,
+    checkpoint.embedded_at,
+    updatedAt
+  ).run();
+}
+
+export async function deleteEmbeddingCheckpoint(db: D1Database, rawPostId: number, contentHash?: string, embeddingModel?: string): Promise<void> {
+  if (contentHash != null && embeddingModel != null) {
+    await db.prepare(
+      "DELETE FROM embedding_checkpoints WHERE raw_post_id = ? AND content_hash = ? AND embedding_model = ?"
+    ).bind(rawPostId, contentHash, embeddingModel).run();
+    return;
+  }
+  await db.prepare("DELETE FROM embedding_checkpoints WHERE raw_post_id = ?").bind(rawPostId).run();
+}
+
+export async function claimAnalysisPrepare(db: D1Database, rawPostId: number, staleBefore: string, claimedAt = nowIso()): Promise<boolean> {
+  const result = await db.prepare(
+    `UPDATE raw_posts
+        SET processing_status = 'embedding', analysis_lease_at = ?,
+            analysis_attempts = COALESCE(analysis_attempts, 0) + 1, updated_at = ?
+      WHERE id = ? AND is_deleted = 0
+        AND (
+          processing_status IN ('pending', 'queued')
+          OR (processing_status = 'processing' AND (analysis_lease_at IS NULL OR analysis_lease_at < ?))
+        )`
+  ).bind(claimedAt, claimedAt, rawPostId, staleBefore).run();
+  return Number(result.meta.changes ?? 0) > 0;
+}
+
+export async function claimAnalysisFinalize(db: D1Database, rawPostId: number, staleBefore: string, claimedAt = nowIso()): Promise<boolean> {
+  const result = await db.prepare(
+    `UPDATE raw_posts
+        SET processing_status = 'analyzing', analysis_lease_at = ?,
+            analysis_attempts = COALESCE(analysis_attempts, 0) + 1, updated_at = ?
+      WHERE id = ? AND is_deleted = 0
+        AND (
+          processing_status = 'embedded'
+          OR (processing_status = 'analyzing' AND (analysis_lease_at IS NULL OR analysis_lease_at < ?))
+        )`
+  ).bind(claimedAt, claimedAt, rawPostId, staleBefore).run();
+  return Number(result.meta.changes ?? 0) > 0;
+}
+
+export async function queueAnalysisPrepare(db: D1Database, rawPostId: number, queuedAt = nowIso()): Promise<boolean> {
+  const result = await db.prepare(
+    `UPDATE raw_posts
+        SET processing_status = 'queued', analysis_lease_at = ?, updated_at = ?
+      WHERE id = ? AND is_deleted = 0 AND processing_status = 'pending'`
+  ).bind(queuedAt, queuedAt, rawPostId).run();
+  return Number(result.meta.changes ?? 0) > 0;
+}
+
+export async function resetQueuedAnalysis(db: D1Database, rawPostId: number, queuedAt: string): Promise<void> {
+  await db.prepare(
+    `UPDATE raw_posts SET processing_status = 'pending', analysis_lease_at = NULL, updated_at = ?
+      WHERE id = ? AND processing_status = 'queued' AND analysis_lease_at = ?`
+  ).bind(nowIso(), rawPostId, queuedAt).run();
+}
+
+export async function markRawPostAnalyzed(
+  db: D1Database,
+  rawPostId: number,
+  contentHash: string,
+  embeddingModel: string,
+  analyzedAt = nowIso()
+): Promise<boolean> {
+  const result = await db.batch([
+    db.prepare(
+      `UPDATE raw_posts
+          SET processing_status = 'analyzed', analysis_content_hash = ?, analysis_lease_at = NULL, updated_at = ?
+        WHERE id = ? AND processing_status = 'analyzing' AND analysis_content_hash = ?`
+    ).bind(contentHash, analyzedAt, rawPostId, contentHash),
+    db.prepare(
+      "DELETE FROM embedding_checkpoints WHERE raw_post_id = ? AND content_hash = ? AND embedding_model = ?"
+    ).bind(rawPostId, contentHash, embeddingModel)
+  ]);
+  return Number(result[0]?.meta.changes ?? 0) > 0;
+}
+
+export async function listStaleAnalysisRawPost(db: D1Database, staleBefore: string): Promise<{ id: number } | null> {
+  return db.prepare(
+    `SELECT id FROM raw_posts
+      WHERE is_deleted = 0
+        AND processing_status IN ('pending', 'queued', 'processing', 'embedding', 'embedded', 'analyzing')
+        AND (analysis_lease_at IS NULL OR analysis_lease_at < ?)
+      ORDER BY COALESCE(analysis_lease_at, updated_at, created_at) ASC, id ASC LIMIT 1`
+  ).bind(staleBefore).first<{ id: number }>();
+}
+
+export async function requeueStaleAnalysis(db: D1Database, rawPostId: number, staleBefore: string, queuedAt = nowIso()): Promise<boolean> {
+  const result = await db.prepare(
+    `UPDATE raw_posts SET processing_status = 'queued', analysis_lease_at = ?, updated_at = ?
+      WHERE id = ? AND is_deleted = 0
+        AND processing_status IN ('pending', 'queued', 'processing', 'embedding', 'embedded', 'analyzing')
+        AND (analysis_lease_at IS NULL OR analysis_lease_at < ?)`
+  ).bind(queuedAt, queuedAt, rawPostId, staleBefore).run();
+  return Number(result.meta.changes ?? 0) > 0;
 }

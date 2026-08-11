@@ -15,6 +15,16 @@ export interface RawPostJob {
   rawPostId: number;
 }
 
+export interface AnalysisPrepareJob {
+  kind: "analysis_prepare";
+  rawPostId: number;
+}
+
+export interface AnalysisFinalizeJob {
+  kind: "analysis_finalize";
+  rawPostId: number;
+}
+
 export interface AnalysisBatchJob {
   kind: "analysis_batch";
   rawPostIds: number[];
@@ -44,6 +54,8 @@ export type QueueJob =
   | PollCycleJob
   | RawIngestJob
   | RawPostJob
+  | AnalysisPrepareJob
+  | AnalysisFinalizeJob
   | AnalysisBatchJob
   | EditorialJob
   | EditorialBatchJob
@@ -56,6 +68,8 @@ export function isQueueJob(value: unknown): value is QueueJob {
   return kind === "poll_cycle"
     || kind === "raw_ingest"
     || kind === "raw_post"
+    || kind === "analysis_prepare"
+    || kind === "analysis_finalize"
     || kind === "analysis_batch"
     || kind === "editorial_candidate"
     || kind === "editorial_batch"

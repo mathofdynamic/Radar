@@ -76,6 +76,21 @@ export interface RawPostRow {
   is_noise: number;
   noise_reason: string | null;
   processing_status: string;
+  analysis_content_hash?: string | null;
+  analysis_lease_at?: string | null;
+  analysis_attempts?: number;
+}
+
+export type EmbeddingCheckpointState = "ready" | "deferred";
+
+export interface EmbeddingCheckpointRow {
+  raw_post_id: number;
+  content_hash: string;
+  embedding_model: string;
+  vector_json: string | null;
+  embedding_state: EmbeddingCheckpointState;
+  embedded_at: string | null;
+  updated_at: string;
 }
 
 export interface EventRow {
@@ -99,6 +114,7 @@ export interface EventRow {
   event_version: number;
   source_count: number;
   independent_confirmation_count: number;
+  originating_raw_post_id?: number | null;
 }
 
 export interface EventEvidence {
