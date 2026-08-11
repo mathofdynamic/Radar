@@ -13,8 +13,10 @@ Cloudflare Cron (tiny: enqueue one tick only)
        -> select bounded due-source batch from D1
        -> fetch + parse Telegram public pages
        -> persist raw posts
-       -> normalization + embeddings + Vectorize
-       -> event clustering + verification
+       -> radar-event-analysis prepare/embed job per raw post
+       -> D1 embedding checkpoint
+       -> radar-event-analysis finalize job per raw post
+       -> Vectorize + event clustering + verification
        -> editorial judgment
        -> publish Queue only for approved stories
 
@@ -26,7 +28,25 @@ Fallback queues are retained for failed individual stages:
 
 The Cron handler deliberately performs no D1 queries, Telegram fetches, HTML parsing, hashing, AI work, or recovery scans. Those operations run inside the `radar-poll` Queue consumer, where the Free-plan CPU constraint is substantially less restrictive.
 
-To stay inside the Workers Free Queues allowance, the normal path does **not** enqueue one message per source or one message per processing stage. One Cron tick creates one `poll_cycle` message; that consumer handles a bounded set of due sources synchronously. The older stage queues are failure fallbacks rather than the default pipeline.
+To stay inside the Workers Free Queues allowance, the normal path does **not** enqueue one message per source. One Cron tick creates one `poll_cycle` message; that consumer handles a bounded set of due sources synchronously. Analysis itself is intentionally one raw post per Queue work unit: a prepare/embed job writes a durable checkpoint, then a finalize job performs the heavier Vectorize and D1 work.
+
+### V6 analysis retry safety
+
+Before V6, `analyzeRawPost()` generated an embedding and then performed Vectorize, duplicate detection, event matching, verification, and scoring in the same retryable function. A CPU termination after the AI call caused the Queue retry to start at the embedding call again. That was the cause of repeated embedding charges and `processing` rows that could not make progress.
+
+V6 uses this durable sequence:
+
+```text
+raw post
+  -> analysis_prepare / normalize + noise handling
+  -> embedding_checkpoints(raw_post_id, normalized content hash, model)
+  -> analysis_finalize / Vectorize + clustering + verification + scoring
+  -> editorial
+```
+
+The checkpoint is written immediately after a successful Workers AI response and before Vectorize. A retry with the same normalized content and embedding model reuses it without reserving another embedding call. Content or model changes invalidate the checkpoint. A completed raw post is marked `analyzed`; its temporary vector payload is then removed, so cleanup cannot make an unfinished retry pay again.
+
+Analysis leases use a ten-minute stale threshold. The poll consumer requeues at most one stale analysis row per cycle, which recovers old `pending`/`processing` work without synchronously flooding a Queue or resetting fresh work.
 
 ## Local setup
 
@@ -83,7 +103,7 @@ Publishing is disabled by default in new environments. Set `PUBLISH_ENABLED` to 
 
 ## Free-plan scheduling budget
 
-With a one-minute Cron, `radar-poll` receives at most 1,440 normal poll-cycle messages per UTC day. A successfully delivered Queue message normally incurs write + read + delete operations, so the scheduler consumes roughly 4,320 Queue operations/day before retries. This leaves headroom under the Free Queues daily allowance for publication jobs and rare fallback-stage retries.
+With a one-minute Cron, `radar-poll` receives at most 1,440 normal poll-cycle messages per UTC day. A successfully delivered Queue message normally incurs write + read + delete operations, so the scheduler consumes roughly 4,320 Queue operations/day before retries. At approximately 500 raw posts/day, V6 adds up to roughly 1,000 analysis messages/day (prepare plus finalize) and up to 500 editorial messages when every post becomes a candidate. That is approximately 8,820 Queue operations/day before retries or fallback messages; noise filtering and below-threshold candidates reduce the normal editorial portion. This remains a tight but plausible Free-plan budget, so retries must remain bounded and the dashboard should be monitored for backlog growth.
 
 The V5 polling capacity is calibrated for freshness: five due sources per minute provide approximately 300 source polls/hour. With 23 active sources and a five-minute target interval, the expected demand is approximately 276 polls/hour. This intentionally balances source freshness against Cloudflare Free per-invocation limits without increasing Queue consumer concurrency.
 
