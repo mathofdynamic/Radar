@@ -1,54 +1,134 @@
+import { z, type ZodType } from "zod";
+import { readBoundedText } from "../crypto";
 import { runtimeConfig } from "../config";
-import { reserveAiCall } from "../db";
+import { incrementCounter, reserveNebulaCall, reserveWorkersAiCall } from "../db";
 import type { JsonObject } from "../types";
 
 export type GeneratedImageMimeType = "image/png" | "image/jpeg";
+export type NebulaStage = "intelligence" | "intelligence_second_pass" | "stage1" | "stage2";
 
 export interface GeneratedImage {
   bytes: ArrayBuffer;
   mimeType: GeneratedImageMimeType;
 }
 
-export async function generateEmbedding(env: Env, text: string): Promise<number[] | null> {
+export interface NebulaUsage {
+  model: string;
+  provider: string | null;
+  promptTokens: number;
+  completionTokens: number;
+}
+
+export interface NebulaJsonResult<T> {
+  data: T;
+  usage: NebulaUsage;
+}
+
+export class NebulaError extends Error {
+  readonly status: number | null;
+
+  constructor(message: string, status: number | null = null) {
+    super(message);
+    this.name = "NebulaError";
+    this.status = status;
+  }
+}
+
+const nebulaJsonSchema = z.record(z.unknown());
+
+export async function generateNebulaJson<T>(
+  env: Env,
+  stage: NebulaStage,
+  systemPrompt: string,
+  userPrompt: string,
+  schema: ZodType<T>,
+  maxTokens = 1_600
+): Promise<NebulaJsonResult<T> | null> {
   const config = runtimeConfig(env);
-  const allowed = await reserveAiCall(env.DB, "embedding", config.maxEmbeddingsPerDay, 12, config.aiDailyNeuronBudget);
-  if (!allowed) return null;
+  const apiKey = env.NEBULA_API_KEY?.trim();
+  if (!apiKey) throw new NebulaError("nebula_api_key_missing");
+
+  const maxCalls = stage === "intelligence"
+    ? config.maxIntelligenceBatchesPerDay
+    : stage === "intelligence_second_pass"
+      ? config.maxIntelligenceSecondPassCallsPerDay
+      : stage === "stage1"
+        ? config.maxStage1CallsPerDay
+        : config.maxStage2CallsPerDay;
+  if (!(await reserveNebulaCall(env.DB, stage, maxCalls))) return null;
+  await safeIncrementCounter(env.DB, "intelligence_ai_calls");
+  if (stage === "intelligence_second_pass") await safeIncrementCounter(env.DB, "intelligence_second_pass_calls");
+
+  const controller = new AbortController();
+  const timeoutId = setTimeout(() => controller.abort(), config.nebulaTimeoutMs);
   try {
-    const result = await env.AI.run(config.embeddingModel, { text: [text.slice(0, 4_000)] });
-    if (isNumberArray(result)) return result;
-    if (isEmbeddingResult(result)) return result.data[0] ?? null;
-    return null;
+    const response = await fetch(`${config.nebulaBaseUrl}/chat/completions`, {
+      method: "POST",
+      headers: {
+        accept: "application/json",
+        "content-type": "application/json",
+        authorization: `Bearer ${apiKey}`
+      },
+      body: JSON.stringify({
+        model: config.nebulaModel,
+        messages: [
+          { role: "system", content: systemPrompt },
+          { role: "user", content: userPrompt }
+        ],
+        response_format: { type: "json_object" },
+        temperature: 0.1,
+        max_tokens: maxTokens
+      }),
+      signal: controller.signal
+    });
+    const responseText = await readBoundedText(response, 2_000_000);
+    if (!response.ok) throw new NebulaError(`nebula_http_${response.status}`, response.status);
+
+    let body: unknown;
+    try {
+      body = JSON.parse(responseText) as unknown;
+    } catch {
+      throw new NebulaError("nebula_response_not_json");
+    }
+    const parsed = schema.safeParse(parseStructuredAiResult(body));
+    if (!parsed.success) throw new NebulaError(`nebula_schema_invalid:${parsed.error.issues[0]?.message ?? "unknown"}`);
+
+    const responseObject = isJsonObject(body) ? body : {};
+    const usage = isJsonObject(responseObject.usage) ? responseObject.usage : {};
+    return {
+      data: parsed.data,
+      usage: {
+        model: getString(responseObject.model) ?? config.nebulaModel,
+        provider: getString(responseObject.provider)
+          ?? response.headers.get("x-nebula-provider")
+          ?? response.headers.get("x-provider"),
+        promptTokens: getNumber(usage.prompt_tokens),
+        completionTokens: getNumber(usage.completion_tokens)
+      }
+    };
   } catch (error) {
-    console.error(JSON.stringify({ event: "ai_embedding_failed", error: error instanceof Error ? error.message : "unknown" }));
-    return null;
+    await safeIncrementCounter(env.DB, "intelligence_ai_failures");
+    if (error instanceof NebulaError) throw error;
+    throw new NebulaError(error instanceof Error ? error.message : "nebula_request_failed");
+  } finally {
+    clearTimeout(timeoutId);
   }
 }
 
 export async function generateStructuredText(env: Env, prompt: string, stage: "stage1" | "stage2"): Promise<JsonObject | null> {
-  const config = runtimeConfig(env);
-  const maxCalls = stage === "stage1" ? config.maxStage1CallsPerDay : config.maxStage2CallsPerDay;
-  const allowed = await reserveAiCall(env.DB, stage, maxCalls, stage === "stage1" ? 40 : 120, config.aiDailyNeuronBudget);
-  if (!allowed) return null;
+  const systemPrompt = "You are a strict Persian-language news editor. Return exactly one valid JSON object. Keep all facts inside the supplied evidence, write title and description in Persian script, and never invent confirmation counts or identifiers.";
   try {
-    const result = await env.AI.run(config.textModel, {
-      messages: [
-        { role: "system", content: "You are a Persian-language news editor. Return one valid JSON object only. The title and description must always be written in Persian script. Translate English evidence into Persian; never copy an English sentence. Do not use Markdown fences. Do not invent facts." },
-        { role: "user", content: prompt.slice(0, 8_000) }
-      ],
-      response_format: { type: "json_object" },
-      temperature: 0.1,
-      max_tokens: 600
-    });
-    return parseStructuredAiResult(result);
+    const result = await generateNebulaJson(env, stage, systemPrompt, prompt.slice(0, 12_000), nebulaJsonSchema, 900);
+    return result?.data ?? null;
   } catch (error) {
-    console.error(JSON.stringify({ event: "ai_structured_text_failed", stage, error: error instanceof Error ? error.message : "unknown" }));
+    console.error(JSON.stringify({ event: "nebula_structured_text_failed", stage, error: error instanceof Error ? error.message : "unknown" }));
     return null;
   }
 }
 
 export async function generateImage(env: Env, prompt: string): Promise<GeneratedImage | null> {
   const config = runtimeConfig(env);
-  const allowed = await reserveAiCall(env.DB, "cover", config.maxCoversPerDay, 500, config.aiDailyNeuronBudget);
+  const allowed = await reserveWorkersAiCall(env.DB, "cover", config.maxCoversPerDay, 500, config.aiDailyNeuronBudget);
   if (!allowed) {
     console.info(JSON.stringify({ event: "ai_image_skipped", reason: "daily_budget_exhausted", model: config.imageModel }));
     return null;
@@ -90,19 +170,28 @@ export function parseStructuredAiResult(value: unknown): JsonObject | null {
   if (!isJsonObject(value)) return null;
 
   if (isJsonObject(value.response)) return value.response;
-  if (isJsonObject(value.result)) return value.result;
-  if (isJsonObject(value.result) && isJsonObject(value.result.response)) return value.result.response;
+  if (isJsonObject(value.result)) {
+    if (isJsonObject(value.result.response)) return value.result.response;
+    return value.result;
+  }
+
+  const choices = Array.isArray(value.choices) ? value.choices : [];
+  const firstChoice = choices[0];
+  if (isJsonObject(firstChoice) && isJsonObject(firstChoice.message)) {
+    const content = firstChoice.message.content;
+    if (isJsonObject(content)) return content;
+    if (typeof content === "string") return parseJsonText(content);
+    if (Array.isArray(content)) {
+      const text = content
+        .filter(isJsonObject)
+        .map((part) => typeof part.text === "string" ? part.text : "")
+        .join("");
+      if (text) return parseJsonText(text);
+    }
+  }
 
   const text = extractText(value);
-  if (!text) return null;
-  const cleaned = stripMarkdownFence(text).trim();
-  const direct = tryParseJson(cleaned);
-  if (direct) return direct;
-
-  const firstBrace = cleaned.indexOf("{");
-  const lastBrace = cleaned.lastIndexOf("}");
-  if (firstBrace >= 0 && lastBrace > firstBrace) return tryParseJson(cleaned.slice(firstBrace, lastBrace + 1));
-  return null;
+  return text ? parseJsonText(text) : null;
 }
 
 function extractText(value: JsonObject): string | null {
@@ -112,16 +201,20 @@ function extractText(value: JsonObject): string | null {
   return null;
 }
 
-function stripMarkdownFence(value: string): string {
-  return value
-    .replace(/^\s*```(?:json)?\s*/iu, "")
-    .replace(/\s*```\s*$/u, "");
-}
-
-function tryParseJson(value: string): JsonObject | null {
+function parseJsonText(value: string): JsonObject | null {
+  const cleaned = value.replace(/^\s*```(?:json)?\s*/iu, "").replace(/\s*```\s*$/u, "").trim();
   try {
-    const parsed: unknown = JSON.parse(value);
-    return isJsonObject(parsed) ? parsed : null;
+    const direct: unknown = JSON.parse(cleaned);
+    if (isJsonObject(direct)) return direct;
+  } catch {
+    // Fall through to the bounded object extraction for accidental prose.
+  }
+  const firstBrace = cleaned.indexOf("{");
+  const lastBrace = cleaned.lastIndexOf("}");
+  if (firstBrace < 0 || lastBrace <= firstBrace) return null;
+  try {
+    const extracted: unknown = JSON.parse(cleaned.slice(firstBrace, lastBrace + 1));
+    return isJsonObject(extracted) ? extracted : null;
   } catch {
     return null;
   }
@@ -131,16 +224,24 @@ function isJsonObject(value: unknown): value is JsonObject {
   return typeof value === "object" && value !== null && !Array.isArray(value);
 }
 
-function isNumberArray(value: unknown): value is number[] {
-  return Array.isArray(value) && value.every((item) => typeof item === "number");
-}
-
-function isEmbeddingResult(value: unknown): value is { data: number[][] } {
-  return isJsonObject(value) && Array.isArray(value.data) && value.data.every((row) => isNumberArray(row));
-}
-
 function isReadableStream(value: unknown): value is ReadableStream<Uint8Array> {
   return typeof value === "object" && value !== null && "getReader" in value && typeof value.getReader === "function";
+}
+
+function getString(value: unknown): string | null {
+  return typeof value === "string" && value.length > 0 ? value : null;
+}
+
+function getNumber(value: unknown): number {
+  return typeof value === "number" && Number.isFinite(value) ? value : 0;
+}
+
+async function safeIncrementCounter(db: D1Database, metric: string): Promise<void> {
+  try {
+    await incrementCounter(db, metric);
+  } catch (error) {
+    console.warn(JSON.stringify({ event: "counter_increment_skipped", metric, error: error instanceof Error ? error.message : "unknown" }));
+  }
 }
 
 function decodeBase64Image(value: string): GeneratedImage | null {

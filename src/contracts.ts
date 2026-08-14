@@ -1,6 +1,58 @@
 import { z } from "zod";
 
 const jsonObjectSchema = z.record(z.unknown());
+export const eventCategorySchema = z.enum([
+  "IRAN",
+  "WORLD",
+  "POLITICS",
+  "WAR_SECURITY",
+  "SOCIETY",
+  "ECONOMY",
+  "TECHNOLOGY"
+]);
+
+export const intelligenceActionSchema = z.enum([
+  "MATCH_EXISTING_EVENT",
+  "NEW_EVENT",
+  "DUPLICATE",
+  "UPDATE_EXISTING_EVENT",
+  "NOISE",
+  "UNCERTAIN"
+]);
+
+export const intelligenceDecisionSchema = z.object({
+  post_ids: z.array(z.number().int().positive()).min(1).max(40),
+  action: intelligenceActionSchema,
+  event_id: z.number().int().positive().nullable(),
+  duplicate_of_post_id: z.number().int().positive().nullable().default(null),
+  confidence: z.number().min(0).max(1),
+  canonical_fact: z.string().min(1).max(800),
+  category: eventCategorySchema,
+  reason: z.string().min(1).max(1_000)
+}).strict().superRefine((decision, context) => {
+  const requiresEvent = decision.action === "MATCH_EXISTING_EVENT" || decision.action === "UPDATE_EXISTING_EVENT";
+  if (requiresEvent !== (decision.event_id !== null)) {
+    context.addIssue({ code: z.ZodIssueCode.custom, path: ["event_id"], message: "event_id does not match action" });
+  }
+  if (decision.action === "DUPLICATE" && decision.duplicate_of_post_id === null) {
+    context.addIssue({ code: z.ZodIssueCode.custom, path: ["duplicate_of_post_id"], message: "duplicate target required" });
+  }
+  if (decision.action !== "DUPLICATE" && decision.duplicate_of_post_id !== null) {
+    context.addIssue({ code: z.ZodIssueCode.custom, path: ["duplicate_of_post_id"], message: "duplicate target only allowed for DUPLICATE" });
+  }
+  if (new Set(decision.post_ids).size !== decision.post_ids.length) {
+    context.addIssue({ code: z.ZodIssueCode.custom, path: ["post_ids"], message: "post_ids must be unique" });
+  }
+  if (decision.duplicate_of_post_id !== null && decision.post_ids.includes(decision.duplicate_of_post_id)) {
+    context.addIssue({ code: z.ZodIssueCode.custom, path: ["duplicate_of_post_id"], message: "duplicate target cannot be in the duplicate group" });
+  }
+});
+
+export const intelligenceBatchOutputSchema = z.object({
+  decisions: z.array(intelligenceDecisionSchema).min(1).max(64)
+}).strict();
+
+export type IntelligenceBatchOutput = z.infer<typeof intelligenceBatchOutputSchema>;
 
 export const polledPostSchema = z.object({
   sourceId: z.number().int().positive(),

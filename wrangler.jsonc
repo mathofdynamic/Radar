@@ -13,11 +13,18 @@
     "POLL_BATCH_SIZE": "5",
     "POLL_INTERVAL_SECONDS": "300",
     "MAX_HTML_BYTES": "524288",
-    "AI_EMBEDDING_MODEL": "@cf/baai/bge-m3",
-    "AI_TEXT_MODEL": "@cf/meta/llama-3.1-8b-instruct-fast",
+    "NEBULA_BASE_URL": "https://nebula-free-llm.nebula-ai-company.workers.dev/v1",
+    "NEBULA_MODEL": "auto",
+    "NEBULA_TIMEOUT_MS": "25000",
+    "INTELLIGENCE_MAX_REPORTS_PER_BATCH": "32",
+    "INTELLIGENCE_MAX_ACTIVE_EVENTS": "40",
+    "INTELLIGENCE_MAX_PAYLOAD_CHARS": "60000",
+    "INTELLIGENCE_MAX_REPORT_CHARS": "1800",
+    "INTELLIGENCE_AMBIGUITY_THRESHOLD": "0.72",
+    "MAX_INTELLIGENCE_BATCHES_PER_DAY": "500",
+    "MAX_INTELLIGENCE_SECOND_PASS_CALLS_PER_DAY": "100",
     "AI_IMAGE_MODEL": "@cf/black-forest-labs/flux-2-klein-4b",
     "AI_DAILY_NEURON_BUDGET": "8000",
-    "MAX_EMBEDDINGS_PER_DAY": "1500",
     "MAX_STAGE1_CALLS_PER_DAY": "250",
     "MAX_STAGE2_CALLS_PER_DAY": "40",
     "MAX_COVERS_PER_DAY": "10",
@@ -25,6 +32,9 @@
     "BREAKING_SCORE": "90",
     "DAILY_STORY_BUDGET": "15",
     "BUSY_DAY_STORY_BUDGET": "25"
+  },
+  "secrets": {
+    "required": ["NEBULA_API_KEY"]
   },
   "d1_databases": [
     {
@@ -86,9 +96,6 @@
     ]
   },
   "ai": { "binding": "AI" },
-  "vectorize": [
-    { "binding": "EVENT_INDEX", "index_name": "radar-events" }
-  ],
   "triggers": {
     "crons": ["* * * * *"]
   },

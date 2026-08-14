@@ -6,7 +6,7 @@ import { getEvent, countStoriesToday, incrementCounter, isPublishingEnabled, set
 import { authenticateDashboardLogin, isDashboardSession, logoutDashboard } from "./auth";
 import { dashboardSnapshot } from "./dashboard-data";
 import { dashboardResponse } from "./dashboard";
-import { enqueueAnalysisPrepare, finalizeRawPost, ingestEnvelope, prepareRawPost, recoverStaleAnalysis } from "./intelligence/pipeline";
+import { enqueueIntelligenceBatch, ingestEnvelope, processIntelligenceBatch, recoverStaleIntelligence } from "./intelligence/pipeline";
 import { buildStoryDraft } from "./editorial/story";
 import { judgeEvent } from "./editorial/judge";
 import { scoreEvent, scoreWithAdjustment, shouldPublish } from "./editorial/scoring";
@@ -16,20 +16,15 @@ import { editPublishedStory, publishStory, verifyTelegramDestination } from "./p
 import { isAdminRequest, isOperatorRequest, healthResponse, opsSummary } from "./ops";
 import type { PublishJob, SourceSeed, StoryDraft, TelegramWebPollEnvelope, VerificationStatus } from "./types";
 import type {
-  AnalysisBatchJob,
-  AnalysisFinalizeJob,
-  AnalysisPrepareJob,
   EditorialBatchJob,
   EditorialJob,
   PollCycleJob,
   PublishQueueJob,
   QueueJob,
   RawIngestJob,
-  RawPostJob,
   ResumePublishingJob
 } from "./queue";
 
-const ANALYSIS_ITEMS_PER_JOB = 1;
 const EDITORIAL_ITEMS_PER_JOB = 2;
 const PUBLISH_RESUME_ITEMS_PER_JOB = 2;
 
@@ -153,10 +148,7 @@ export default {
 async function dispatchQueueJob(queue: string, body: QueueJob, env: Env): Promise<void> {
   if (queue === "radar-poll" && body.kind === "poll_cycle") return processPollCycle(env, body);
   if (queue === "radar-raw-ingest" && body.kind === "raw_ingest") return processRawIngest(env, body);
-  if (queue === "radar-event-analysis" && body.kind === "analysis_prepare") return processAnalysisPrepare(env, body);
-  if (queue === "radar-event-analysis" && body.kind === "analysis_finalize") return processAnalysisFinalize(env, body);
-  if (queue === "radar-event-analysis" && body.kind === "analysis_batch") return processAnalysisBatch(env, body);
-  if (queue === "radar-event-analysis" && body.kind === "raw_post") return processAnalysis(env, body);
+  if (queue === "radar-event-analysis" && body.kind === "intelligence_batch") return processIntelligenceBatch(env, body);
   if (queue === "radar-editorial" && body.kind === "editorial_batch") return processEditorialBatch(env, body);
   if (queue === "radar-editorial" && body.kind === "editorial_candidate") return processEditorial(env, body);
   if (queue === "radar-publish" && body.kind === "resume_publishing") return processResumePublishing(env, body);
@@ -176,11 +168,9 @@ async function processPollCycle(env: Env, job: PollCycleJob): Promise<void> {
   await incrementCounter(env.DB, "poll_cycles");
   if (envelopes.length > 0) await incrementCounter(env.DB, "poll_envelopes_observed", envelopes.length);
 
-  const rawPostIds: number[] = [];
   for (const envelope of envelopes) {
     try {
-      const rawPostId = await ingestEnvelope(env, envelope, { enqueueAnalysis: false });
-      rawPostIds.push(rawPostId);
+      await ingestEnvelope(env, envelope, { enqueueAnalysis: false });
     } catch (error) {
       const errorMessage = normalizeErrorMessage(error);
       console.error(JSON.stringify({ event: "poll_ingest_failed", source_id: envelope.sourceId, message_id: envelope.externalMessageId, error: errorMessage }));
@@ -189,47 +179,13 @@ async function processPollCycle(env: Env, job: PollCycleJob): Promise<void> {
     }
   }
 
-  let queuedJobs = 0;
-  for (const rawPostId of uniqueNumbers(rawPostIds)) {
-    if (await enqueueAnalysisPrepare(env, rawPostId)) queuedJobs += 1;
-  }
-  if (queuedJobs > 0) await incrementCounter(env.DB, "analysis_batches_queued", queuedJobs);
-  await recoverStaleAnalysis(env);
+  await recoverStaleIntelligence(env);
+  await enqueueIntelligenceBatch(env, job.scheduledAt);
 }
 
 async function processRawIngest(env: Env, job: RawIngestJob): Promise<void> {
   const envelope = telegramWebPollEnvelopeSchema.parse(job.envelope) as TelegramWebPollEnvelope;
-  await ingestEnvelope(env, envelope);
-}
-
-async function processAnalysis(env: Env, job: RawPostJob): Promise<void> {
-  await prepareRawPost(env, job.rawPostId);
-}
-
-async function processAnalysisPrepare(env: Env, job: AnalysisPrepareJob): Promise<void> {
-  await prepareRawPost(env, job.rawPostId);
-}
-
-async function processAnalysisFinalize(env: Env, job: AnalysisFinalizeJob): Promise<void> {
-  await finalizeRawPost(env, job.rawPostId);
-}
-
-async function processAnalysisBatch(env: Env, job: AnalysisBatchJob): Promise<void> {
-  const current = uniqueNumbers(job.rawPostIds).slice(0, ANALYSIS_ITEMS_PER_JOB);
-  const remaining = uniqueNumbers(job.rawPostIds).slice(ANALYSIS_ITEMS_PER_JOB);
-  for (const rawPostId of current) {
-    try {
-      await prepareRawPost(env, rawPostId);
-    } catch (error) {
-      console.error(JSON.stringify({ event: "analysis_batch_item_failed", raw_post_id: rawPostId, error: normalizeErrorMessage(error) }));
-      await safeIncrementCounter(env.DB, "analysis_item_failures");
-      await env.EVENT_ANALYSIS_QUEUE.send({ kind: "analysis_prepare", rawPostId } satisfies AnalysisPrepareJob);
-    }
-  }
-
-  if (remaining.length > 0) {
-    await env.EVENT_ANALYSIS_QUEUE.send({ kind: "analysis_batch", rawPostIds: remaining } satisfies AnalysisBatchJob);
-  }
+  await ingestEnvelope(env, envelope, { enqueueAnalysis: false });
 }
 
 async function processEditorialBatch(env: Env, job: EditorialBatchJob): Promise<void> {
@@ -420,7 +376,7 @@ async function processPublish(env: Env, job: PublishQueueJob): Promise<void> {
         job.job.story.category,
         JSON.stringify(job.job.story.tags),
         JSON.stringify(job.job.story.links),
-        env.AI_TEXT_MODEL,
+        runtimeConfig(env).nebulaModel,
         timestamp,
         job.job.publishKey
       ),
@@ -534,7 +490,7 @@ async function persistPendingStory(env: Env, job: PublishJob, timestamp: string)
     `INSERT INTO published_stories(event_id, event_version, publish_key, title, description, verification_status, independent_confirmations, primary_sources_json, category, entity_tags_json, links_json, story_model, publication_state, created_at, updated_at)
      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'processing', ?, ?)
      ON CONFLICT(publish_key) DO UPDATE SET publication_state = 'processing', last_error = NULL, updated_at = excluded.updated_at`
-  ).bind(story.eventId, story.eventVersion, job.publishKey, story.title, story.description, story.verificationStatus, story.independentConfirmations, JSON.stringify(story.primarySources), story.category, JSON.stringify(story.tags), JSON.stringify(story.links), env.AI_TEXT_MODEL, timestamp, timestamp).run();
+  ).bind(story.eventId, story.eventVersion, job.publishKey, story.title, story.description, story.verificationStatus, story.independentConfirmations, JSON.stringify(story.primarySources), story.category, JSON.stringify(story.tags), JSON.stringify(story.links), runtimeConfig(env).nebulaModel, timestamp, timestamp).run();
 }
 
 async function recordPublishFailure(db: D1Database, eventId: number, eventVersion: number, publishKey: string, error: string): Promise<void> {
@@ -603,16 +559,6 @@ async function safeIncrementCounter(db: D1Database, metric: string, amount = 1):
   } catch (error) {
     console.warn(JSON.stringify({ event: "counter_increment_skipped", metric, error: normalizeErrorMessage(error) }));
   }
-}
-
-function uniqueNumbers(values: number[]): number[] {
-  return [...new Set(values.filter((value) => Number.isSafeInteger(value) && value > 0))];
-}
-
-function chunk<T>(values: T[], size: number): T[][] {
-  const result: T[][] = [];
-  for (let index = 0; index < values.length; index += size) result.push(values.slice(index, index + size));
-  return result;
 }
 
 async function seedSourcesIfEmpty(env: Env): Promise<void> {

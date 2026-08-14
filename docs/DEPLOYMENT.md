@@ -1,8 +1,8 @@
-# Radar Cloudflare Deployment Runbook
+# Radar V8 Deployment Runbook
 
-Target account: `mathofdynamic2`.
+This branch is review-only. Do not deploy it, apply migration `0008` remotely, enable publishing, or delete the existing `radar-events` resource during V8 review.
 
-## 1. Install and validate locally
+## Local validation
 
 ```powershell
 npm install
@@ -11,23 +11,30 @@ npm run types:check
 npm run typecheck
 npm test
 npm run deploy:dry
+git diff --check
 ```
 
-## 2. Create Cloudflare resources
+## Required resources
+
+- D1: `radar-db`;
+- Queues: `radar-poll`, `radar-raw-ingest`, `radar-event-analysis`, `radar-editorial`, `radar-publish`, `radar-dead-letter`;
+- Workers AI binding `AI` for optional image covers only.
+
+Radar V8 has no `EVENT_INDEX` binding and no Vectorize runtime dependency. The pre-existing `radar-events` Vectorize index is an orphaned resource and must be reviewed/deleted manually later, never automatically by this branch.
+
+## Nebula secret/configuration
+
+The Worker configuration contains the public endpoint and `NEBULA_MODEL=auto`. The API key must be stored as a Worker secret and never committed:
 
 ```powershell
-npx wrangler d1 create radar-db
-npx wrangler queues create radar-raw-ingest
-npx wrangler queues create radar-event-analysis
-npx wrangler queues create radar-editorial
-npx wrangler queues create radar-publish
-npx wrangler queues create radar-dead-letter
-npx wrangler vectorize create radar-events --dimensions 1024 --metric cosine
+npx wrangler secret put NEBULA_API_KEY
 ```
 
-R2 is not required. Replace the D1 `database_id` in `wrangler.jsonc` with the ID returned by Wrangler.
+Do not add provider keys to Radar. Nebula owns provider routing and fallback.
 
-## 3. Apply migrations
+## Migration order after approval
+
+Only after review approval:
 
 ```powershell
 npx wrangler d1 migrations apply radar-db --remote
@@ -35,78 +42,19 @@ npm run types
 npm run types:check
 ```
 
-Migration `0002_rename_cover_reference.sql` removes the old R2-specific column name from the already-created database. Covers are generated in memory and uploaded directly to Telegram.
+Migration `0008_remove_embedding_pipeline.sql` drops the obsolete checkpoint table, requeues unfinished legacy analysis states, and creates durable Nebula batch audit tables. It does not delete raw posts, events, or evidence. This command is intentionally not run during the V8 implementation task.
 
-## 4. Set secrets
+## Publishing safety
 
-The bot token previously shared in chat is compromised. Revoke it in BotFather first and generate a replacement. Never pass the value as a command-line argument or commit it.
+Before any later deployment, verify both:
 
-```powershell
-npx wrangler secret put TELEGRAM_BOT_TOKEN
-npx wrangler secret put RADAR_ADMIN_KEY
-npx wrangler secret put RADAR_DASHBOARD_USERNAME
-npx wrangler secret put RADAR_DASHBOARD_PASSWORD
+```text
+wrangler.jsonc: PUBLISH_ENABLED=false
+D1 runtime_settings: publishing_enabled=false
 ```
 
-Use a long random password for the dashboard. The Worker does not contain a default credential and fails closed until both dashboard secrets exist. The protected console is served at `/admin` after deployment.
+No Stage-2 story generation, cover generation, Telegram send, or publishing-resume operation is allowed during this review. Do not enable publishing until backtest, smoke tests, and manual review are complete.
 
-## 5. Deploy with publishing disabled
+## Operational checks after an approved deployment
 
-Confirm `PUBLISH_ENABLED` is `false` in `wrangler.jsonc`, then:
-
-```powershell
-npx wrangler deploy
-```
-
-Check the public health endpoint:
-
-```powershell
-Invoke-RestMethod https://radar-pipeline.<your-workers-subdomain>.workers.dev/health
-```
-
-## 6. Seed and validate sources
-
-Use the admin key only through an authorization header:
-
-```powershell
-$headers = @{ Authorization = "Bearer <RADAR_ADMIN_KEY>" }
-Invoke-RestMethod -Method Post -Headers $headers -Uri https://radar-pipeline.<your-workers-subdomain>.workers.dev/admin/bootstrap-sources
-Invoke-RestMethod -Method Post -Headers $headers -Uri https://radar-pipeline.<your-workers-subdomain>.workers.dev/admin/validate-sources
-```
-
-The validator activates only sources whose public Telegram page returns message markers. Failed sources remain inactive with `health_status=invalid` and a recorded error.
-
-## 7. Verify the destination bot
-
-```powershell
-Invoke-RestMethod -Headers $headers -Uri https://radar-pipeline.<your-workers-subdomain>.workers.dev/admin/verify-telegram
-```
-
-The bot must be an administrator of `-1004496469105` and have posting permission.
-
-## 8. Enable publishing
-
-After the bot check succeeds, change `PUBLISH_ENABLED` to `true`, redeploy, and requeue candidates that were held while publishing was disabled:
-
-```powershell
-npx wrangler deploy
-Invoke-RestMethod -Method Post -Headers $headers -Uri https://radar-pipeline.<your-workers-subdomain>.workers.dev/admin/requeue-pending
-```
-
-The first live run should be monitored with:
-
-```powershell
-npx wrangler tail radar-pipeline --format json
-```
-
-## Admin dashboard
-
-Open `https://radar-pipeline.<your-workers-subdomain>.workers.dev/admin` and sign in with the dashboard secrets. The console refreshes automatically every minute and exposes source health, pulled Telegram posts, clustered events, verification, editorial decisions, published stories, D1 counters, AI usage, queue failures, and operator actions.
-
-## Recovery
-
-- Queue failures are retried by Cloudflare; inspect `queue_failures` and dead-letter state.
-- Raw posts and events remain in D1 when AI calls fail.
-- Covers are generated in memory with Workers AI when available. If generation or Telegram image processing fails, the story is published as a text-only Telegram message.
-- Publishing retries are guarded by `publish_key = event:<id>:version:<version>`.
-- If Telegram accepts a message while the Worker crashes before persistence, reconcile the channel manually before requeueing the candidate.
+Check `/health`, `/ops/summary`, Queue failures/dead letters, `intelligence_batches`, `intelligence_batch_items`, stale leases, Nebula failure counters, and raw-post backlog. Confirm fresh pending reports are not starved by historical recovery. Confirm no provider credentials or API keys appear in logs or batch audit rows.

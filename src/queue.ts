@@ -10,24 +10,9 @@ export interface RawIngestJob {
   envelope: TelegramWebPollEnvelope;
 }
 
-export interface RawPostJob {
-  kind: "raw_post";
-  rawPostId: number;
-}
-
-export interface AnalysisPrepareJob {
-  kind: "analysis_prepare";
-  rawPostId: number;
-}
-
-export interface AnalysisFinalizeJob {
-  kind: "analysis_finalize";
-  rawPostId: number;
-}
-
-export interface AnalysisBatchJob {
-  kind: "analysis_batch";
-  rawPostIds: number[];
+export interface IntelligenceBatchJob {
+  kind: "intelligence_batch";
+  batchId: number;
 }
 
 export interface EditorialJob {
@@ -53,10 +38,7 @@ export interface ResumePublishingJob {
 export type QueueJob =
   | PollCycleJob
   | RawIngestJob
-  | RawPostJob
-  | AnalysisPrepareJob
-  | AnalysisFinalizeJob
-  | AnalysisBatchJob
+  | IntelligenceBatchJob
   | EditorialJob
   | EditorialBatchJob
   | PublishQueueJob
@@ -67,10 +49,7 @@ export function isQueueJob(value: unknown): value is QueueJob {
   const kind = (value as { kind?: unknown }).kind;
   return kind === "poll_cycle"
     || kind === "raw_ingest"
-    || kind === "raw_post"
-    || kind === "analysis_prepare"
-    || kind === "analysis_finalize"
-    || kind === "analysis_batch"
+    || kind === "intelligence_batch"
     || kind === "editorial_candidate"
     || kind === "editorial_batch"
     || kind === "publish"

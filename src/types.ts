@@ -6,6 +6,15 @@ export type EventUpdateType = "NO_CHANGE" | "MINOR_UPDATE" | "MAJOR_UPDATE" | "C
 export type EditorialDecision = "PUBLISH" | "MONITOR" | "IGNORE";
 export type SourceRole = "primary_source" | "authority_confirmation" | "breaking_radar" | "specialist" | "aggregator";
 export type PriorityTier = "TIER_1" | "TIER_2" | "TIER_3";
+export type IntelligenceAction =
+  | "MATCH_EXISTING_EVENT"
+  | "NEW_EVENT"
+  | "DUPLICATE"
+  | "UPDATE_EXISTING_EVENT"
+  | "NOISE"
+  | "UNCERTAIN";
+export type EventCategory = "IRAN" | "WORLD" | "POLITICS" | "WAR_SECURITY" | "SOCIETY" | "ECONOMY" | "TECHNOLOGY";
+export type IntelligenceBatchStatus = "queued" | "processing" | "completed" | "failed";
 
 export interface SourceSeed {
   source_key: string;
@@ -79,18 +88,51 @@ export interface RawPostRow {
   analysis_content_hash?: string | null;
   analysis_lease_at?: string | null;
   analysis_attempts?: number;
+  created_at?: string;
+  updated_at?: string;
 }
 
-export type EmbeddingCheckpointState = "ready" | "deferred";
+export interface IntelligenceDecision {
+  post_ids: number[];
+  action: IntelligenceAction;
+  event_id: number | null;
+  duplicate_of_post_id: number | null;
+  confidence: number;
+  canonical_fact: string;
+  category: EventCategory;
+  reason: string;
+}
 
-export interface EmbeddingCheckpointRow {
-  raw_post_id: number;
-  content_hash: string;
-  embedding_model: string;
-  vector_json: string | null;
-  embedding_state: EmbeddingCheckpointState;
-  embedded_at: string | null;
+export interface IntelligenceBatchRow {
+  id: number;
+  batch_key: string;
+  window_start: string;
+  window_end: string;
+  batch_sequence: number;
+  status: IntelligenceBatchStatus;
+  report_count: number;
+  model_requested: string;
+  provider_used: string | null;
+  attempts: number;
+  prompt_tokens: number;
+  completion_tokens: number;
+  lease_at: string | null;
+  error: string | null;
+  created_at: string;
+  completed_at: string | null;
   updated_at: string;
+}
+
+export interface IntelligenceBatchItemRow {
+  batch_id: number;
+  raw_post_id: number;
+  action: IntelligenceAction;
+  event_id: number | null;
+  duplicate_of_post_id: number | null;
+  confidence: number;
+  item_status: "claimed" | "applied" | "released";
+  decision_json: string;
+  created_at: string;
 }
 
 export interface EventRow {

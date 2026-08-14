@@ -1,5 +1,5 @@
 import type { RuntimeConfig } from "./config";
-import type { EmbeddingCheckpointRow, EventRow, PolledPost, RawPostRow, SourceRow, SourceSeed, TelegramWebPollEnvelope } from "./types";
+import type { EventRow, PolledPost, RawPostRow, SourceRow, SourceSeed, TelegramWebPollEnvelope } from "./types";
 
 export function nowIso(): string {
   return new Date().toISOString();
@@ -159,13 +159,6 @@ export async function updateSourcePollFailure(db: D1Database, sourceId: number, 
   ).bind(nextPoll, error.slice(0, 500), timestamp, sourceId).run();
 }
 
-export async function listRecentRawPosts(db: D1Database, limit = 250): Promise<RawPostRow[]> {
-  const result = await db.prepare(
-    `SELECT * FROM raw_posts WHERE is_deleted = 0 AND is_noise = 0 ORDER BY COALESCE(published_at, observed_at) DESC LIMIT ?`
-  ).bind(limit).all<RawPostRow>();
-  return result.results;
-}
-
 export async function getEvent(db: D1Database, eventId: number): Promise<EventRow | null> {
   return db.prepare("SELECT * FROM events WHERE id = ?").bind(eventId).first<EventRow>();
 }
@@ -206,7 +199,7 @@ export async function isPublishingEnabled(db: D1Database, fallback: boolean): Pr
   return value == null ? fallback : value === "true";
 }
 
-export async function reserveAiCall(db: D1Database, stage: string, maxCalls: number, estimatedNeurons: number, dailyBudget: number): Promise<boolean> {
+export async function reserveWorkersAiCall(db: D1Database, stage: string, maxCalls: number, estimatedNeurons: number, dailyBudget: number): Promise<boolean> {
   if (estimatedNeurons <= 0 || estimatedNeurons > dailyBudget) return false;
   const date = new Date().toISOString().slice(0, 10);
   const stageUsage = await db.prepare("SELECT calls FROM ai_usage WHERE usage_date = ? AND stage = ?")
@@ -235,6 +228,22 @@ export async function reserveAiCall(db: D1Database, stage: string, maxCalls: num
   return true;
 }
 
+/** Nebula is metered by bounded request counts, not Workers AI neurons. */
+export async function reserveNebulaCall(db: D1Database, stage: string, maxCalls: number): Promise<boolean> {
+  if (maxCalls <= 0) return false;
+  const date = new Date().toISOString().slice(0, 10);
+  const stageUsage = await db.prepare("SELECT calls FROM ai_usage WHERE usage_date = ? AND stage = ?")
+    .bind(date, stage).first<{ calls: number }>();
+  if ((stageUsage?.calls ?? 0) >= maxCalls) return false;
+
+  const timestamp = nowIso();
+  await db.prepare(
+    `INSERT INTO ai_usage(usage_date, stage, calls, estimated_neurons, updated_at) VALUES (?, ?, 1, 0, ?)
+     ON CONFLICT(usage_date, stage) DO UPDATE SET calls = calls + 1, updated_at = excluded.updated_at`
+  ).bind(date, stage, timestamp).run();
+  return true;
+}
+
 export async function countStoriesToday(db: D1Database): Promise<number> {
   const date = new Date().toISOString().slice(0, 10);
   const row = await db.prepare("SELECT COUNT(*) AS count FROM published_stories WHERE publication_state = 'published' AND substr(published_at, 1, 10) = ?")
@@ -257,136 +266,36 @@ export async function recordSourcePostFingerprint(db: D1Database, post: PolledPo
   return row?.content_hash === post.contentHash;
 }
 
-export async function getEmbeddingCheckpoint(
+export async function claimIntelligenceReport(
   db: D1Database,
   rawPostId: number,
-  contentHash: string,
-  embeddingModel: string
-): Promise<EmbeddingCheckpointRow | null> {
-  return db.prepare(
-    `SELECT raw_post_id, content_hash, embedding_model, vector_json, embedding_state, embedded_at, updated_at
-       FROM embedding_checkpoints
-      WHERE raw_post_id = ? AND content_hash = ? AND embedding_model = ?`
-  ).bind(rawPostId, contentHash, embeddingModel).first<EmbeddingCheckpointRow>();
-}
-
-export async function saveEmbeddingCheckpoint(
-  db: D1Database,
-  checkpoint: Omit<EmbeddingCheckpointRow, "updated_at"> & { updated_at?: string }
-): Promise<void> {
-  const updatedAt = checkpoint.updated_at ?? nowIso();
-  await db.prepare(
-    `INSERT INTO embedding_checkpoints(
-       raw_post_id, content_hash, embedding_model, vector_json, embedding_state, embedded_at, updated_at
-     ) VALUES (?, ?, ?, ?, ?, ?, ?)
-     ON CONFLICT(raw_post_id) DO UPDATE SET
-       content_hash = excluded.content_hash,
-       embedding_model = excluded.embedding_model,
-       vector_json = excluded.vector_json,
-       embedding_state = excluded.embedding_state,
-       embedded_at = excluded.embedded_at,
-       updated_at = excluded.updated_at`
-  ).bind(
-    checkpoint.raw_post_id,
-    checkpoint.content_hash,
-    checkpoint.embedding_model,
-    checkpoint.vector_json,
-    checkpoint.embedding_state,
-    checkpoint.embedded_at,
-    updatedAt
-  ).run();
-}
-
-export async function deleteEmbeddingCheckpoint(db: D1Database, rawPostId: number, contentHash?: string, embeddingModel?: string): Promise<void> {
-  if (contentHash != null && embeddingModel != null) {
-    await db.prepare(
-      "DELETE FROM embedding_checkpoints WHERE raw_post_id = ? AND content_hash = ? AND embedding_model = ?"
-    ).bind(rawPostId, contentHash, embeddingModel).run();
-    return;
-  }
-  await db.prepare("DELETE FROM embedding_checkpoints WHERE raw_post_id = ?").bind(rawPostId).run();
-}
-
-export async function claimAnalysisPrepare(db: D1Database, rawPostId: number, staleBefore: string, claimedAt = nowIso()): Promise<boolean> {
+  analysisContentHash: string,
+  staleBefore: string,
+  claimedAt = nowIso()
+): Promise<boolean> {
   const result = await db.prepare(
     `UPDATE raw_posts
-        SET processing_status = 'embedding', analysis_lease_at = ?,
+        SET processing_status = 'analyzing', analysis_content_hash = ?, analysis_lease_at = ?,
             analysis_attempts = COALESCE(analysis_attempts, 0) + 1, updated_at = ?
       WHERE id = ? AND is_deleted = 0
         AND (
           processing_status IN ('pending', 'queued')
-          OR (processing_status = 'processing' AND (analysis_lease_at IS NULL OR analysis_lease_at < ?))
-        )`
-  ).bind(claimedAt, claimedAt, rawPostId, staleBefore).run();
-  return Number(result.meta.changes ?? 0) > 0;
-}
-
-export async function claimAnalysisFinalize(db: D1Database, rawPostId: number, staleBefore: string, claimedAt = nowIso()): Promise<boolean> {
-  const result = await db.prepare(
-    `UPDATE raw_posts
-        SET processing_status = 'analyzing', analysis_lease_at = ?,
-            analysis_attempts = COALESCE(analysis_attempts, 0) + 1, updated_at = ?
-      WHERE id = ? AND is_deleted = 0
-        AND (
-          processing_status = 'embedded'
           OR (processing_status = 'analyzing' AND (analysis_lease_at IS NULL OR analysis_lease_at < ?))
         )`
-  ).bind(claimedAt, claimedAt, rawPostId, staleBefore).run();
+  ).bind(analysisContentHash, claimedAt, claimedAt, rawPostId, staleBefore).run();
   return Number(result.meta.changes ?? 0) > 0;
-}
-
-export async function queueAnalysisPrepare(db: D1Database, rawPostId: number, queuedAt = nowIso()): Promise<boolean> {
-  const result = await db.prepare(
-    `UPDATE raw_posts
-        SET processing_status = 'queued', analysis_lease_at = ?, updated_at = ?
-      WHERE id = ? AND is_deleted = 0 AND processing_status = 'pending'`
-  ).bind(queuedAt, queuedAt, rawPostId).run();
-  return Number(result.meta.changes ?? 0) > 0;
-}
-
-export async function resetQueuedAnalysis(db: D1Database, rawPostId: number, queuedAt: string): Promise<void> {
-  await db.prepare(
-    `UPDATE raw_posts SET processing_status = 'pending', analysis_lease_at = NULL, updated_at = ?
-      WHERE id = ? AND processing_status = 'queued' AND analysis_lease_at = ?`
-  ).bind(nowIso(), rawPostId, queuedAt).run();
 }
 
 export async function markRawPostAnalyzed(
   db: D1Database,
   rawPostId: number,
   contentHash: string,
-  embeddingModel: string,
   analyzedAt = nowIso()
 ): Promise<boolean> {
-  const result = await db.batch([
-    db.prepare(
-      `UPDATE raw_posts
-          SET processing_status = 'analyzed', analysis_content_hash = ?, analysis_lease_at = NULL, updated_at = ?
-        WHERE id = ? AND processing_status = 'analyzing' AND analysis_content_hash = ?`
-    ).bind(contentHash, analyzedAt, rawPostId, contentHash),
-    db.prepare(
-      "DELETE FROM embedding_checkpoints WHERE raw_post_id = ? AND content_hash = ? AND embedding_model = ?"
-    ).bind(rawPostId, contentHash, embeddingModel)
-  ]);
-  return Number(result[0]?.meta.changes ?? 0) > 0;
-}
-
-export async function listStaleAnalysisRawPost(db: D1Database, staleBefore: string): Promise<{ id: number } | null> {
-  return db.prepare(
-    `SELECT id FROM raw_posts
-      WHERE is_deleted = 0
-        AND processing_status IN ('pending', 'queued', 'processing', 'embedding', 'embedded', 'analyzing')
-        AND (analysis_lease_at IS NULL OR analysis_lease_at < ?)
-      ORDER BY COALESCE(analysis_lease_at, updated_at, created_at) ASC, id ASC LIMIT 1`
-  ).bind(staleBefore).first<{ id: number }>();
-}
-
-export async function requeueStaleAnalysis(db: D1Database, rawPostId: number, staleBefore: string, queuedAt = nowIso()): Promise<boolean> {
   const result = await db.prepare(
-    `UPDATE raw_posts SET processing_status = 'queued', analysis_lease_at = ?, updated_at = ?
-      WHERE id = ? AND is_deleted = 0
-        AND processing_status IN ('pending', 'queued', 'processing', 'embedding', 'embedded', 'analyzing')
-        AND (analysis_lease_at IS NULL OR analysis_lease_at < ?)`
-  ).bind(queuedAt, queuedAt, rawPostId, staleBefore).run();
+    `UPDATE raw_posts
+        SET processing_status = 'analyzed', analysis_content_hash = ?, analysis_lease_at = NULL, updated_at = ?
+      WHERE id = ? AND processing_status = 'analyzing' AND analysis_content_hash = ?`
+  ).bind(contentHash, analyzedAt, rawPostId, contentHash).run();
   return Number(result.meta.changes ?? 0) > 0;
 }
