@@ -1,4 +1,5 @@
 import { spawnSync } from "node:child_process";
+import path from "node:path";
 
 const BASE_URL = (process.env.NEBULA_BASE_URL || "https://nebula-free-llm.nebula-ai-company.workers.dev/v1").replace(/\/+$/u, "");
 const API_KEY = process.env.NEBULA_API_KEY?.trim();
@@ -285,7 +286,7 @@ function parseOutput(body) {
 }
 
 function queryD1(command) {
-  const binary = process.platform === "win32" ? "node_modules/.bin/wrangler.cmd" : "node_modules/.bin/wrangler";
+  const binary = path.resolve(process.cwd(), "node_modules/.bin", process.platform === "win32" ? "wrangler.cmd" : "wrangler");
   const result = spawnSync(binary, ["d1", "execute", "radar-db", "--remote", "--json", "--command", command], {
     cwd: process.cwd(),
     encoding: "utf8",
