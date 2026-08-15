@@ -14,7 +14,7 @@ Cloudflare Cron every minute
   -> raw_posts in D1
   -> deterministic normalization/noise filtering
   -> durable five-minute intelligence_batch job
-  -> Nebula /v1/chat/completions, model=auto
+  -> Nebula /v1/chat/completions, intelligence model=radar-fast
   -> validated event grouping decisions
   -> deterministic event/source relationships and origin groups
   -> deterministic verification and importance scoring
@@ -50,10 +50,13 @@ The Worker uses:
 ```text
 NEBULA_BASE_URL=https://nebula-free-llm.nebula-ai-company.workers.dev/v1
 NEBULA_API_KEY=<Worker secret>
-NEBULA_MODEL=auto
+NEBULA_INTELLIGENCE_MODEL=radar-fast
+NEBULA_EDITORIAL_MODEL=auto
+NEBULA_INTELLIGENCE_TIMEOUT_MS=95000
+NEBULA_EDITORIAL_TIMEOUT_MS=25000
 ```
 
-The API key is never committed. Nebula owns provider routing and fallback. Radar does not store provider credentials or rotate provider keys. Workers AI remains only for optional image cover generation.
+`NEBULA_MODEL` and `NEBULA_TIMEOUT_MS` remain legacy compatibility fallbacks for editorial work. The API key is never committed. Nebula owns provider routing and fallback. Radar does not store provider credentials or rotate provider keys. Workers AI remains only for optional image cover generation.
 
 ## Local setup
 

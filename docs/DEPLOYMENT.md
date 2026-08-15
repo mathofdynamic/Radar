@@ -24,7 +24,7 @@ Radar V8 has no `EVENT_INDEX` binding and no Vectorize runtime dependency. The p
 
 ## Nebula secret/configuration
 
-The Worker configuration contains the public endpoint and `NEBULA_MODEL=auto`. The API key must be stored as a Worker secret and never committed:
+The Worker configuration uses `NEBULA_INTELLIGENCE_MODEL=radar-fast` for structured event intelligence and `NEBULA_EDITORIAL_MODEL=auto` for editorial text. Intelligence requests allow `NEBULA_INTELLIGENCE_TIMEOUT_MS=95000` so Nebula can complete its own provider fallback. The API key must be stored as a Worker secret and never committed:
 
 ```powershell
 npx wrangler secret put NEBULA_API_KEY

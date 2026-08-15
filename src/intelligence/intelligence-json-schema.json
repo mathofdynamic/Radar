@@ -1,0 +1,65 @@
+{
+  "type": "object",
+  "additionalProperties": false,
+  "properties": {
+    "decisions": {
+      "type": "array",
+      "minItems": 1,
+      "maxItems": 64,
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "post_ids": {
+            "type": "array",
+            "minItems": 1,
+            "maxItems": 40,
+            "items": { "type": "integer", "minimum": 1 }
+          },
+          "action": {
+            "type": "string",
+            "enum": ["MATCH_EXISTING_EVENT", "NEW_EVENT", "DUPLICATE", "UPDATE_EXISTING_EVENT", "NOISE", "UNCERTAIN"]
+          },
+          "event_id": {
+            "anyOf": [{ "type": "integer", "minimum": 1 }, { "type": "null" }]
+          },
+          "duplicate_of_post_id": {
+            "anyOf": [{ "type": "integer", "minimum": 1 }, { "type": "null" }]
+          },
+          "confidence": { "type": "number", "minimum": 0, "maximum": 1 },
+          "canonical_fact": { "type": "string", "minLength": 1, "maxLength": 800 },
+          "category": {
+            "type": "string",
+            "enum": ["IRAN", "WORLD", "POLITICS", "WAR_SECURITY", "SOCIETY", "ECONOMY", "TECHNOLOGY"]
+          },
+          "reason": { "type": "string", "minLength": 1, "maxLength": 1000 }
+        },
+        "required": ["post_ids", "action", "event_id", "duplicate_of_post_id", "confidence", "canonical_fact", "category", "reason"],
+        "anyOf": [
+          {
+            "properties": {
+              "action": { "enum": ["MATCH_EXISTING_EVENT", "UPDATE_EXISTING_EVENT"] },
+              "event_id": { "type": "integer", "minimum": 1 },
+              "duplicate_of_post_id": { "type": "null" }
+            }
+          },
+          {
+            "properties": {
+              "action": { "enum": ["DUPLICATE"] },
+              "event_id": { "type": "null" },
+              "duplicate_of_post_id": { "type": "integer", "minimum": 1 }
+            }
+          },
+          {
+            "properties": {
+              "action": { "enum": ["NEW_EVENT", "NOISE", "UNCERTAIN"] },
+              "event_id": { "type": "null" },
+              "duplicate_of_post_id": { "type": "null" }
+            }
+          }
+        ]
+      }
+    }
+  },
+  "required": ["decisions"]
+}

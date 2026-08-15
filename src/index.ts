@@ -376,7 +376,7 @@ async function processPublish(env: Env, job: PublishQueueJob): Promise<void> {
         job.job.story.category,
         JSON.stringify(job.job.story.tags),
         JSON.stringify(job.job.story.links),
-        runtimeConfig(env).nebulaModel,
+        runtimeConfig(env).nebulaEditorialModel,
         timestamp,
         job.job.publishKey
       ),
@@ -490,7 +490,7 @@ async function persistPendingStory(env: Env, job: PublishJob, timestamp: string)
     `INSERT INTO published_stories(event_id, event_version, publish_key, title, description, verification_status, independent_confirmations, primary_sources_json, category, entity_tags_json, links_json, story_model, publication_state, created_at, updated_at)
      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'processing', ?, ?)
      ON CONFLICT(publish_key) DO UPDATE SET publication_state = 'processing', last_error = NULL, updated_at = excluded.updated_at`
-  ).bind(story.eventId, story.eventVersion, job.publishKey, story.title, story.description, story.verificationStatus, story.independentConfirmations, JSON.stringify(story.primarySources), story.category, JSON.stringify(story.tags), JSON.stringify(story.links), runtimeConfig(env).nebulaModel, timestamp, timestamp).run();
+  ).bind(story.eventId, story.eventVersion, job.publishKey, story.title, story.description, story.verificationStatus, story.independentConfirmations, JSON.stringify(story.primarySources), story.category, JSON.stringify(story.tags), JSON.stringify(story.links), runtimeConfig(env).nebulaEditorialModel, timestamp, timestamp).run();
 }
 
 async function recordPublishFailure(db: D1Database, eventId: number, eventVersion: number, publishKey: string, error: string): Promise<void> {

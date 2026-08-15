@@ -1,4 +1,5 @@
 import { z } from "zod";
+import intelligenceBatchJsonSchema from "./intelligence/intelligence-json-schema.json";
 
 const jsonObjectSchema = z.record(z.unknown());
 export const eventCategorySchema = z.enum([
@@ -24,7 +25,7 @@ export const intelligenceDecisionSchema = z.object({
   post_ids: z.array(z.number().int().positive()).min(1).max(40),
   action: intelligenceActionSchema,
   event_id: z.number().int().positive().nullable(),
-  duplicate_of_post_id: z.number().int().positive().nullable().default(null),
+  duplicate_of_post_id: z.number().int().positive().nullable(),
   confidence: z.number().min(0).max(1),
   canonical_fact: z.string().min(1).max(800),
   category: eventCategorySchema,
@@ -53,6 +54,9 @@ export const intelligenceBatchOutputSchema = z.object({
 }).strict();
 
 export type IntelligenceBatchOutput = z.infer<typeof intelligenceBatchOutputSchema>;
+
+/** Shared strict descriptor consumed by Nebula and the read-only backtest. */
+export { intelligenceBatchJsonSchema };
 
 export const polledPostSchema = z.object({
   sourceId: z.number().int().positive(),

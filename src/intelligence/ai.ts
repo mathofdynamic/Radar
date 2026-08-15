@@ -1,6 +1,7 @@
 import { z, type ZodType } from "zod";
 import { readBoundedText } from "../crypto";
 import { runtimeConfig } from "../config";
+import { intelligenceBatchJsonSchema } from "../contracts";
 import { incrementCounter, reserveNebulaCall, reserveWorkersAiCall } from "../db";
 import type { JsonObject } from "../types";
 
@@ -13,8 +14,14 @@ export interface GeneratedImage {
 }
 
 export interface NebulaUsage {
+  requestedModel: string;
   model: string;
   provider: string | null;
+  routedModel: string | null;
+  fallbackAttempts: number;
+  requestId: string | null;
+  status: number | null;
+  latencyMs: number;
   promptTokens: number;
   completionTokens: number;
 }
@@ -26,12 +33,24 @@ export interface NebulaJsonResult<T> {
 
 export class NebulaError extends Error {
   readonly status: number | null;
+  readonly telemetry: NebulaTelemetry | null;
 
-  constructor(message: string, status: number | null = null) {
+  constructor(message: string, status: number | null = null, telemetry: NebulaTelemetry | null = null) {
     super(message);
     this.name = "NebulaError";
     this.status = status;
+    this.telemetry = telemetry;
   }
+}
+
+export interface NebulaTelemetry {
+  requestedModel: string;
+  provider: string | null;
+  routedModel: string | null;
+  fallbackAttempts: number;
+  requestId: string | null;
+  status: number | null;
+  latencyMs: number;
 }
 
 const nebulaJsonSchema = z.record(z.unknown());
@@ -48,6 +67,10 @@ export async function generateNebulaJson<T>(
   const apiKey = env.NEBULA_API_KEY?.trim();
   if (!apiKey) throw new NebulaError("nebula_api_key_missing");
 
+  const isIntelligence = stage === "intelligence" || stage === "intelligence_second_pass";
+  const requestedModel = isIntelligence ? config.nebulaIntelligenceModel : config.nebulaEditorialModel;
+  const timeoutMs = isIntelligence ? config.nebulaIntelligenceTimeoutMs : config.nebulaEditorialTimeoutMs;
+
   const maxCalls = stage === "intelligence"
     ? config.maxIntelligenceBatchesPerDay
     : stage === "intelligence_second_pass"
@@ -60,7 +83,17 @@ export async function generateNebulaJson<T>(
   if (stage === "intelligence_second_pass") await safeIncrementCounter(env.DB, "intelligence_second_pass_calls");
 
   const controller = new AbortController();
-  const timeoutId = setTimeout(() => controller.abort(), config.nebulaTimeoutMs);
+  const timeoutId = setTimeout(() => controller.abort(), timeoutMs);
+  const startedAt = Date.now();
+  let telemetry: NebulaTelemetry = {
+    requestedModel,
+    provider: null,
+    routedModel: null,
+    fallbackAttempts: 0,
+    requestId: null,
+    status: null,
+    latencyMs: 0
+  };
   try {
     const response = await fetch(`${config.nebulaBaseUrl}/chat/completions`, {
       method: "POST",
@@ -70,49 +103,101 @@ export async function generateNebulaJson<T>(
         authorization: `Bearer ${apiKey}`
       },
       body: JSON.stringify({
-        model: config.nebulaModel,
+        model: requestedModel,
         messages: [
           { role: "system", content: systemPrompt },
           { role: "user", content: userPrompt }
         ],
-        response_format: { type: "json_object" },
+        response_format: isIntelligence
+          ? {
+              type: "json_schema",
+              json_schema: {
+                name: "radar_intelligence_batch",
+                strict: true,
+                schema: intelligenceBatchJsonSchema
+              }
+            }
+          : { type: "json_object" },
         temperature: 0.1,
         max_tokens: maxTokens
       }),
       signal: controller.signal
     });
+    telemetry = readNebulaTelemetry(response, requestedModel, startedAt);
     const responseText = await readBoundedText(response, 2_000_000);
-    if (!response.ok) throw new NebulaError(`nebula_http_${response.status}`, response.status);
+    if (!response.ok) throw new NebulaError(`nebula_http_${response.status}`, response.status, telemetry);
 
     let body: unknown;
     try {
       body = JSON.parse(responseText) as unknown;
     } catch {
-      throw new NebulaError("nebula_response_not_json");
+      throw new NebulaError("nebula_response_not_json", response.status, telemetry);
     }
     const parsed = schema.safeParse(parseStructuredAiResult(body));
-    if (!parsed.success) throw new NebulaError(`nebula_schema_invalid:${parsed.error.issues[0]?.message ?? "unknown"}`);
+    if (!parsed.success) throw new NebulaError(`nebula_schema_invalid:${parsed.error.issues[0]?.message ?? "unknown"}`, response.status, telemetry);
 
     const responseObject = isJsonObject(body) ? body : {};
     const usage = isJsonObject(responseObject.usage) ? responseObject.usage : {};
+    const responseModel = getString(responseObject.model);
     return {
       data: parsed.data,
       usage: {
-        model: getString(responseObject.model) ?? config.nebulaModel,
-        provider: getString(responseObject.provider)
-          ?? response.headers.get("x-nebula-provider")
-          ?? response.headers.get("x-provider"),
+        ...telemetry,
+        model: responseModel ?? telemetry.routedModel ?? requestedModel,
         promptTokens: getNumber(usage.prompt_tokens),
         completionTokens: getNumber(usage.completion_tokens)
       }
     };
   } catch (error) {
     await safeIncrementCounter(env.DB, "intelligence_ai_failures");
-    if (error instanceof NebulaError) throw error;
-    throw new NebulaError(error instanceof Error ? error.message : "nebula_request_failed");
+    const normalized = error instanceof NebulaError
+      ? error
+      : new NebulaError(error instanceof Error ? error.message : "nebula_request_failed", null, {
+      ...telemetry,
+      latencyMs: Date.now() - startedAt
+    });
+    if (normalized.telemetry) {
+      console.warn(JSON.stringify({
+        event: "nebula_request_failed",
+        stage,
+        error: normalized.message.slice(0, 240),
+        ...normalized.telemetry
+      }));
+    }
+    throw normalized;
   } finally {
     clearTimeout(timeoutId);
   }
+}
+
+function readNebulaTelemetry(response: Response, requestedModel: string, startedAt: number): NebulaTelemetry {
+  const routedVia = response.headers.get("x-routed-via");
+  const route = parseRoutedVia(routedVia);
+  return {
+    requestedModel,
+    provider: route.provider,
+    routedModel: route.model,
+    fallbackAttempts: parseNonNegativeInteger(response.headers.get("x-fallback-attempts")),
+    requestId: response.headers.get("x-request-id"),
+    status: response.status,
+    latencyMs: Date.now() - startedAt
+  };
+}
+
+export function parseRoutedVia(value: string | null): { provider: string | null; model: string | null } {
+  const route = value?.trim();
+  if (!route) return { provider: null, model: null };
+  const slash = route.indexOf("/");
+  if (slash < 0) return { provider: route, model: null };
+  return {
+    provider: route.slice(0, slash) || null,
+    model: route.slice(slash + 1) || null
+  };
+}
+
+function parseNonNegativeInteger(value: string | null): number {
+  const parsed = Number(value);
+  return Number.isInteger(parsed) && parsed >= 0 ? parsed : 0;
 }
 
 export async function generateStructuredText(env: Env, prompt: string, stage: "stage1" | "stage2"): Promise<JsonObject | null> {

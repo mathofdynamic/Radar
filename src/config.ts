@@ -6,8 +6,10 @@ export interface RuntimeConfig {
   pollIntervalSeconds: number;
   maxHtmlBytes: number;
   nebulaBaseUrl: string;
-  nebulaModel: string;
-  nebulaTimeoutMs: number;
+  nebulaIntelligenceModel: string;
+  nebulaEditorialModel: string;
+  nebulaIntelligenceTimeoutMs: number;
+  nebulaEditorialTimeoutMs: number;
   intelligenceMaxReportsPerBatch: number;
   intelligenceMaxActiveEvents: number;
   intelligenceMaxPayloadChars: number;
@@ -32,6 +34,8 @@ function numberSetting(value: string | undefined, fallback: number): number {
 }
 
 export function runtimeConfig(env: Env): RuntimeConfig {
+  const legacyModel = env.NEBULA_MODEL || "auto";
+  const legacyTimeout = numberSetting(env.NEBULA_TIMEOUT_MS, 25_000);
   return {
     destinationChatId: env.RADAR_DESTINATION_CHAT_ID,
     destinationUrl: env.RADAR_DESTINATION_URL,
@@ -40,8 +44,10 @@ export function runtimeConfig(env: Env): RuntimeConfig {
     pollIntervalSeconds: Math.max(60, numberSetting(env.POLL_INTERVAL_SECONDS, 300)),
     maxHtmlBytes: Math.max(64_000, numberSetting(env.MAX_HTML_BYTES, 524_288)),
     nebulaBaseUrl: (env.NEBULA_BASE_URL || "https://nebula-free-llm.nebula-ai-company.workers.dev/v1").replace(/\/+$/u, ""),
-    nebulaModel: env.NEBULA_MODEL || "auto",
-    nebulaTimeoutMs: Math.max(5_000, Math.min(55_000, numberSetting(env.NEBULA_TIMEOUT_MS, 25_000))),
+    nebulaIntelligenceModel: env.NEBULA_INTELLIGENCE_MODEL || "radar-fast",
+    nebulaEditorialModel: env.NEBULA_EDITORIAL_MODEL || legacyModel,
+    nebulaIntelligenceTimeoutMs: Math.max(5_000, Math.min(95_000, numberSetting(env.NEBULA_INTELLIGENCE_TIMEOUT_MS, 95_000))),
+    nebulaEditorialTimeoutMs: Math.max(5_000, Math.min(55_000, numberSetting(env.NEBULA_EDITORIAL_TIMEOUT_MS, legacyTimeout))),
     intelligenceMaxReportsPerBatch: Math.max(1, Math.min(40, numberSetting(env.INTELLIGENCE_MAX_REPORTS_PER_BATCH, 32))),
     intelligenceMaxActiveEvents: Math.max(1, Math.min(100, numberSetting(env.INTELLIGENCE_MAX_ACTIVE_EVENTS, 40))),
     intelligenceMaxPayloadChars: Math.max(8_000, Math.min(120_000, numberSetting(env.INTELLIGENCE_MAX_PAYLOAD_CHARS, 60_000))),

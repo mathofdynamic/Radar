@@ -20,7 +20,10 @@ Required configuration:
 
 ```text
 NEBULA_BASE_URL=https://nebula-free-llm.nebula-ai-company.workers.dev/v1
-NEBULA_MODEL=auto
+NEBULA_INTELLIGENCE_MODEL=radar-fast
+NEBULA_EDITORIAL_MODEL=auto
+NEBULA_INTELLIGENCE_TIMEOUT_MS=95000
+NEBULA_EDITORIAL_TIMEOUT_MS=25000
 NEBULA_API_KEY=Worker secret
 PUBLISH_ENABLED=false
 ```

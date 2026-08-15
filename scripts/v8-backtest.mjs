@@ -1,14 +1,17 @@
 import { spawnSync } from "node:child_process";
 import path from "node:path";
+import intelligenceBatchJsonSchema from "../src/intelligence/intelligence-json-schema.json" with { type: "json" };
 
 const BASE_URL = (process.env.NEBULA_BASE_URL || "https://nebula-free-llm.nebula-ai-company.workers.dev/v1").replace(/\/+$/u, "");
 const API_KEY = process.env.NEBULA_API_KEY?.trim();
 const LIMIT = Math.max(500, Number(process.env.RADAR_BACKTEST_LIMIT || 500));
+const SAMPLE = process.env.RADAR_BACKTEST_SAMPLE || "latest-v8-500";
+const SAMPLE_LIMIT = SAMPLE === "baseline-v8-500" ? 500 : LIMIT;
 const MAX_REPORT_CHARS = 1_800;
 const MAX_REPORTS_PER_BATCH = 32;
 const MAX_PAYLOAD_CHARS = 60_000;
 const AMBIGUITY_THRESHOLD = 0.72;
-const REQUEST_TIMEOUT_MS = Math.max(5_000, Number(process.env.RADAR_BACKTEST_REQUEST_TIMEOUT_MS || 25_000));
+const REQUEST_TIMEOUT_MS = Math.max(5_000, Number(process.env.RADAR_BACKTEST_REQUEST_TIMEOUT_MS || 95_000));
 const MAX_CONCURRENT_BATCHES = Math.max(1, Math.min(8, Number(process.env.RADAR_BACKTEST_CONCURRENCY || 1)));
 const REVIEW_TEXT_CHARS = 320;
 const REVIEW_STOP_WORDS = new Set(["the", "and", "for", "with", "from", "that", "this", "در", "از", "به", "با", "برای", "که", "این", "آن"]);
@@ -24,6 +27,13 @@ Use only supplied post_ids and event_id values. Confidence must reflect uncertai
 Radar, not you, calculates independent source confirmations and verification status.
 Return exactly one JSON object with a decisions array and no Markdown.`;
 
+const BASELINE_SAMPLE_START = "2026-08-13T20:37:52.000Z";
+const BASELINE_SAMPLE_END = "2026-08-14T07:55:01.000Z";
+const SAMPLE_FILTER = SAMPLE === "baseline-v8-500"
+  ? `AND COALESCE(rp.published_at, rp.observed_at) >= '${BASELINE_SAMPLE_START}'
+      AND COALESCE(rp.published_at, rp.observed_at) <= '${BASELINE_SAMPLE_END}'`
+  : "";
+
 if (!API_KEY) {
   console.error("BACKTEST_BLOCKED: NEBULA_API_KEY is not available in the process environment.");
   console.error("Production-derived D1 data is available, but the Worker secret cannot be read from D1 or inferred safely.");
@@ -36,13 +46,14 @@ const reports = queryD1(`
          COALESCE(rp.normalized_text, rp.original_text) AS text,
          GROUP_CONCAT(DISTINCT es.event_id) AS event_ids,
          GROUP_CONCAT(DISTINCT es.origin_group) AS origin_groups
-    FROM raw_posts rp
-    JOIN sources s ON s.id = rp.source_id
-    LEFT JOIN event_sources es ON es.raw_post_id = rp.id
+   FROM raw_posts rp
+   JOIN sources s ON s.id = rp.source_id
+   LEFT JOIN event_sources es ON es.raw_post_id = rp.id
    WHERE rp.is_deleted = 0 AND rp.is_noise = 0
+     ${SAMPLE_FILTER}
    GROUP BY rp.id
    ORDER BY COALESCE(rp.published_at, rp.observed_at) DESC, rp.id DESC
-   LIMIT ${LIMIT}
+   LIMIT ${SAMPLE_LIMIT}
 `).map((row) => ({
   id: Number(row.id),
   source_id: Number(row.source_id),
@@ -97,6 +108,8 @@ const metrics = {
   nebula_successful: 0,
   nebula_failed: 0,
   fallback_recoveries: 0,
+  fallback_attempts: 0,
+  fallback_wins: 0,
   http_429: 0,
   http_5xx: 0,
   timeouts: 0,
@@ -109,6 +122,7 @@ const metrics = {
   rejected_unsafe_responses: 0,
   prompt_tokens: 0,
   output_tokens: 0,
+  token_samples: [],
   estimated_prompt_tokens: 0,
   estimated_output_tokens: 0,
   primary_uncertain: 0,
@@ -149,7 +163,7 @@ async function processBatch(batch, batchIndex) {
     metrics.primary_calls += 1;
     const primary = await callNebula(batch.reports, activeEvents, "primary");
     recordNebulaTelemetry(metrics, primary.telemetry);
-    addTokenMetrics(metrics, primary);
+    addTokenMetrics(metrics, primary, batch.reports.length);
     decisions = validateDecisions(primary.output, batch.reports, knownEventIds, new Set(batch.reports.map((report) => report.id)));
   } catch (error) {
     metrics.failed_batches += 1;
@@ -168,7 +182,7 @@ async function processBatch(batch, batchIndex) {
       metrics.second_pass_calls += 1;
       const second = await callNebula(focusedReports, focusedEvents, "ambiguity");
       recordNebulaTelemetry(metrics, second.telemetry);
-      addTokenMetrics(metrics, second);
+      addTokenMetrics(metrics, second, focusedReports.length);
       const resolved = validateDecisions(second.output, focusedReports, knownEventIds, new Set(batch.reports.map((report) => report.id)));
       const resolvedIds = new Set(uncertainIds);
       decisions = [...decisions.filter((decision) => !decision.post_ids.some((id) => resolvedIds.has(id))), ...resolved];
@@ -201,12 +215,14 @@ const sampleDates = reports.map((report) => new Date(report.published_at || repo
 const sampleStart = sampleDates.length > 0 ? new Date(Math.min(...sampleDates.map((date) => date.getTime()))) : null;
 const sampleEnd = sampleDates.length > 0 ? new Date(Math.max(...sampleDates.map((date) => date.getTime()))) : null;
 const sampleDurationHours = sampleStart && sampleEnd ? Math.max((sampleEnd.getTime() - sampleStart.getTime()) / 3_600_000, 5 / 60) : null;
-const targetScale = reports.length > 0 ? 341 / reports.length : null;
 const totalCalls = metrics.primary_calls + metrics.second_pass_calls;
 const totalPairComparisons = metrics.existing_event_agreements + metrics.disagreements;
 const providerDistribution = [...metrics.provider_distribution.entries()].map(([provider, values]) => ({ provider, ...values }));
 const latencies = metrics.request_telemetry.map((request) => request.latency_ms).filter((value) => Number.isFinite(value));
+const productionProjection = buildProductionProjection(reports, activeEvents, metrics, totalCalls);
 console.log(JSON.stringify({
+  sample_selection: SAMPLE,
+  baseline_selection_exactness: SAMPLE === "baseline-v8-500" ? "deterministic_date_bounded_reconstruction" : "latest_ordered_sample",
   reports_tested: metrics.reports_tested,
   windows: metrics.windows,
   batches: metrics.batches,
@@ -216,11 +232,13 @@ console.log(JSON.stringify({
   successful: metrics.nebula_successful,
   failed: metrics.nebula_failed,
   fallback_recoveries: metrics.fallback_recoveries,
+  fallback_attempts: metrics.fallback_attempts,
+  fallback_wins: metrics.fallback_wins,
   http_429: metrics.http_429,
   http_5xx: metrics.http_5xx,
   timeouts: metrics.timeouts,
   request_telemetry_records: metrics.request_telemetry.length,
-  latency_ms: { average: average(latencies), median: median(latencies), maximum: latencies.length === 0 ? null : Math.max(...latencies) },
+  latency_ms: { average: average(latencies), median: median(latencies), p95: percentile(latencies, 0.95), maximum: latencies.length === 0 ? null : Math.max(...latencies) },
   provider_distribution: providerDistribution,
   routed_model_distribution: [...metrics.routed_model_distribution.entries()].map(([model, calls]) => ({ model, calls })),
   average_reports_per_request: batches.length === 0 ? null : Number((reports.length / batches.length).toFixed(4)),
@@ -249,23 +267,11 @@ console.log(JSON.stringify({
   second_pass_failures: metrics.second_pass_failures,
   copied_source_cases: metrics.copied_source_cases,
   manual_review: metrics.manual_review,
-  production_projection_at_341_reports_per_hour: targetScale === null ? null : {
-    primary_calls_per_hour: Number((metrics.primary_calls * targetScale).toFixed(3)),
-    second_pass_calls_per_hour: Number((metrics.second_pass_calls * targetScale).toFixed(3)),
-    total_calls_per_hour: Number((totalCalls * targetScale).toFixed(3)),
-    input_tokens_per_hour: Number((metrics.prompt_tokens * targetScale).toFixed(3)),
-    output_tokens_per_hour: Number((metrics.output_tokens * targetScale).toFixed(3)),
-    primary_calls_per_day: Number((metrics.primary_calls * targetScale * 24).toFixed(3)),
-    second_pass_calls_per_day: Number((metrics.second_pass_calls * targetScale * 24).toFixed(3)),
-    total_calls_per_day: Number((totalCalls * targetScale * 24).toFixed(3)),
-    input_tokens_per_day: Number((metrics.prompt_tokens * targetScale * 24).toFixed(3)),
-    output_tokens_per_day: Number((metrics.output_tokens * targetScale * 24).toFixed(3)),
-    request_reduction_vs_one_call_per_report: Number((1 - totalCalls / reports.length).toFixed(4))
-  },
+  production_projection_at_341_reports_per_hour: productionProjection,
   observed_calls_per_hour: sampleDurationHours === null ? null : Number((totalCalls / sampleDurationHours).toFixed(3)),
   agreement_rate: totalPairComparisons === 0 ? null : Number((metrics.existing_event_agreements / totalPairComparisons).toFixed(4)),
   nebula_base_url: BASE_URL,
-  model_requested: "auto",
+  model_requested: "radar-fast",
   request_timeout_ms: REQUEST_TIMEOUT_MS,
   concurrency: MAX_CONCURRENT_BATCHES,
   mutation: "none"
@@ -305,7 +311,72 @@ function buildBatches(rows) {
 }
 
 async function callNebula(batchReports, events, pass) {
-  const userPrompt = JSON.stringify({
+  const userPrompt = buildUserPrompt(batchReports, events, pass);
+  if (userPrompt.length + INTELLIGENCE_SYSTEM_PROMPT.length > MAX_PAYLOAD_CHARS) throw new Error("backtest_payload_too_large");
+
+  const startedAt = Date.now();
+  let response;
+  let body = null;
+  try {
+    response = await fetch(`${BASE_URL}/chat/completions`, {
+      method: "POST",
+      headers: { accept: "application/json", "content-type": "application/json", authorization: `Bearer ${API_KEY}` },
+      body: JSON.stringify({
+        model: "radar-fast",
+        messages: [
+          { role: "system", content: INTELLIGENCE_SYSTEM_PROMPT },
+          { role: "user", content: userPrompt }
+        ],
+        response_format: {
+          type: "json_schema",
+          json_schema: {
+            name: "radar_intelligence_batch",
+            strict: true,
+            schema: intelligenceBatchJsonSchema
+          }
+        },
+        temperature: 0.1,
+        max_tokens: 2_000
+      }),
+      signal: AbortSignal.timeout(REQUEST_TIMEOUT_MS)
+    });
+  } catch (cause) {
+    const error = new Error(cause?.name === "TimeoutError" ? `nebula_timeout_${REQUEST_TIMEOUT_MS}` : `nebula_request_failed:${cause instanceof Error ? cause.message : String(cause)}`);
+    error.backtestCode = cause?.name === "TimeoutError" ? "timeout" : "request_failed";
+    error.telemetry = buildNebulaTelemetry(null, null, startedAt, "radar-fast");
+    throw error;
+  }
+  body = await response.json().catch(() => null);
+  const telemetry = buildNebulaTelemetry(response, body, startedAt, "radar-fast");
+  if (!response.ok) {
+    const error = new Error(`nebula_http_${response.status}`);
+    error.backtestCode = `http_${response.status}`;
+    error.telemetry = telemetry;
+    throw error;
+  }
+  const output = parseOutput(body);
+  if (!output) {
+    const error = new Error("nebula_backtest_invalid_json");
+    error.backtestCode = "malformed_json";
+    error.telemetry = { ...telemetry, structured_json: false };
+    throw error;
+  }
+  const outputChars = JSON.stringify(output).length;
+  const promptTokens = Number(body?.usage?.prompt_tokens || 0);
+  const outputTokens = Number(body?.usage?.completion_tokens || body?.usage?.output_tokens || 0);
+  return {
+    output,
+    prompt_tokens: promptTokens > 0 ? promptTokens : Math.ceil(userPrompt.length / 4),
+    output_tokens: outputTokens > 0 ? outputTokens : Math.ceil(outputChars / 4),
+    prompt_tokens_estimated: promptTokens <= 0,
+    output_tokens_estimated: outputTokens <= 0,
+    telemetry: { ...telemetry, structured_json: true },
+    report_count: batchReports.length
+  };
+}
+
+function buildUserPrompt(batchReports, events, pass) {
+  return JSON.stringify({
     task: "Classify every supplied report exactly once. Group reports that describe the same real-world event.",
     pass,
     output_rules: {
@@ -337,59 +408,6 @@ async function callNebula(batchReports, events, pass) {
       existing_confirmation_count_is_context_only: event.independent_confirmation_count
     }))
   });
-  if (userPrompt.length > MAX_PAYLOAD_CHARS) throw new Error("backtest_payload_too_large");
-
-  const startedAt = Date.now();
-  let response;
-  let body = null;
-  try {
-    response = await fetch(`${BASE_URL}/chat/completions`, {
-      method: "POST",
-      headers: { accept: "application/json", "content-type": "application/json", authorization: `Bearer ${API_KEY}` },
-      body: JSON.stringify({
-        model: "auto",
-        messages: [
-          { role: "system", content: INTELLIGENCE_SYSTEM_PROMPT },
-          { role: "user", content: userPrompt }
-        ],
-        response_format: { type: "json_object" },
-        temperature: 0.1,
-        max_tokens: 2_000
-      }),
-      signal: AbortSignal.timeout(REQUEST_TIMEOUT_MS)
-    });
-  } catch (cause) {
-    const error = new Error(cause?.name === "TimeoutError" ? `nebula_timeout_${REQUEST_TIMEOUT_MS}` : `nebula_request_failed:${cause instanceof Error ? cause.message : String(cause)}`);
-    error.backtestCode = cause?.name === "TimeoutError" ? "timeout" : "request_failed";
-    error.telemetry = buildNebulaTelemetry(null, null, startedAt, pass);
-    throw error;
-  }
-  body = await response.json().catch(() => null);
-  const telemetry = buildNebulaTelemetry(response, body, startedAt, pass);
-  if (!response.ok) {
-    const error = new Error(`nebula_http_${response.status}`);
-    error.backtestCode = `http_${response.status}`;
-    error.telemetry = telemetry;
-    throw error;
-  }
-  const output = parseOutput(body);
-  if (!output) {
-    const error = new Error("nebula_backtest_invalid_json");
-    error.backtestCode = "malformed_json";
-    error.telemetry = { ...telemetry, structured_json: false };
-    throw error;
-  }
-  const outputChars = JSON.stringify(output).length;
-  const promptTokens = Number(body?.usage?.prompt_tokens || 0);
-  const outputTokens = Number(body?.usage?.completion_tokens || body?.usage?.output_tokens || 0);
-  return {
-    output,
-    prompt_tokens: promptTokens > 0 ? promptTokens : Math.ceil(userPrompt.length / 4),
-    output_tokens: outputTokens > 0 ? outputTokens : Math.ceil(outputChars / 4),
-    prompt_tokens_estimated: promptTokens <= 0,
-    output_tokens_estimated: outputTokens <= 0,
-    telemetry: { ...telemetry, structured_json: true }
-  };
 }
 
 function validateDecisions(output, batchReports, knownEventIds, allowedPostIds) {
@@ -400,6 +418,7 @@ function validateDecisions(output, batchReports, knownEventIds, allowedPostIds) 
     if (!decision || typeof decision !== "object" || Array.isArray(decision)) throw validationError("schema_failure", "decision_shape_invalid");
     const allowedKeys = new Set(["post_ids", "action", "event_id", "duplicate_of_post_id", "confidence", "canonical_fact", "category", "reason"]);
     if (Object.keys(decision).some((key) => !allowedKeys.has(key))) throw validationError("schema_failure", "decision_unknown_field");
+    if (!Object.hasOwn(decision, "duplicate_of_post_id")) throw validationError("schema_failure", "duplicate_target_missing");
     if (!ACTIONS.has(decision.action) || !Array.isArray(decision.post_ids) || decision.post_ids.length === 0 || decision.post_ids.length > 40) throw validationError("schema_failure", "decision_shape_invalid");
     if (new Set(decision.post_ids).size !== decision.post_ids.length || decision.post_ids.some((postId) => !Number.isInteger(postId) || postId <= 0)) throw validationError("schema_failure", "post_ids_invalid");
     if (decision.event_id !== null && (!Number.isInteger(decision.event_id) || !knownEventIds.has(decision.event_id))) throw validationError(decision.event_id == null ? "schema_failure" : "unknown_event_id", `unknown_event_id:${decision.event_id}`);
@@ -425,40 +444,19 @@ function validationError(code, message) {
   return error;
 }
 
-function buildNebulaTelemetry(response, body, startedAt, pass) {
+function buildNebulaTelemetry(response, body, startedAt, requestedModel) {
   const headers = response?.headers;
-  const provider = firstNonEmpty([
-    getHeader(headers, ["x-nebula-provider", "x-routed-provider", "x-provider", "x-ai-provider"]),
-    body?.provider,
-    body?.provider_name,
-    body?.routing?.provider,
-    body?.metadata?.provider
-  ]) || "unknown";
-  const routedModel = firstNonEmpty([
-    getHeader(headers, ["x-nebula-model", "x-routed-model", "x-model"]),
-    body?.routed_model,
-    body?.routing?.model,
-    body?.model
-  ]);
-  const retryCount = firstNumber([
-    getHeader(headers, ["x-nebula-retries", "x-retry-count", "x-retries"]),
-    body?.routing?.retry_count,
-    body?.retry_count
-  ]);
-  const fallbackCount = firstNumber([
-    getHeader(headers, ["x-nebula-fallbacks", "x-fallback-count", "x-provider-fallbacks"]),
-    body?.routing?.fallback_count,
-    body?.fallback_count
-  ]) || (isTruthy(getHeader(headers, ["x-nebula-fallback", "x-fallback"])) ? 1 : 0);
+  const route = parseRoutedVia(getHeader(headers, ["x-routed-via"]));
+  const fallbackCount = firstNumber([getHeader(headers, ["x-fallback-attempts"])]) ?? 0;
   return {
-    pass,
-    requested_model: "auto",
-    provider,
-    routed_model: routedModel || null,
+    requested_model: requestedModel,
+    provider: route.provider || "unknown",
+    routed_model: route.model,
+    fallback_attempts: fallbackCount,
+    request_id: getHeader(headers, ["x-request-id"]),
     status: response?.status ?? null,
     latency_ms: Date.now() - startedAt,
-    retry_count: retryCount ?? 0,
-    fallback_count: fallbackCount,
+    body_model: firstNonEmpty([body?.model]),
     structured_json: false
   };
 }
@@ -466,34 +464,36 @@ function buildNebulaTelemetry(response, body, startedAt, pass) {
 function recordNebulaTelemetry(metrics, telemetry) {
   if (!telemetry) return;
   metrics.request_telemetry.push({
-    pass: telemetry.pass,
     requested_model: telemetry.requested_model,
     provider: telemetry.provider,
     routed_model: telemetry.routed_model,
+    request_id: telemetry.request_id,
     status: telemetry.status,
     latency_ms: telemetry.latency_ms,
-    retry_count: telemetry.retry_count,
-    fallback_count: telemetry.fallback_count
+    fallback_attempts: telemetry.fallback_attempts
   });
   const success = telemetry.status != null && telemetry.status >= 200 && telemetry.status < 300;
   if (success) metrics.nebula_successful += 1;
   else metrics.nebula_failed += 1;
   if (telemetry.status === 429) metrics.http_429 += 1;
   if (telemetry.status != null && telemetry.status >= 500) metrics.http_5xx += 1;
-  metrics.fallback_recoveries += telemetry.fallback_count || 0;
+  metrics.fallback_attempts += telemetry.fallback_attempts || 0;
+  if (success && telemetry.fallback_attempts > 0) metrics.fallback_wins += 1;
+  metrics.fallback_recoveries += success && telemetry.fallback_attempts > 0 ? 1 : 0;
   const provider = telemetry.provider || "unknown";
-  const entry = metrics.provider_distribution.get(provider) || { calls: 0, success: 0, failure: 0, fallback_recoveries: 0 };
+  const entry = metrics.provider_distribution.get(provider) || { calls: 0, success: 0, failure: 0, fallback_wins: 0 };
   entry.calls += 1;
   if (success) entry.success += 1;
   else entry.failure += 1;
-  entry.fallback_recoveries += telemetry.fallback_count || 0;
+  if (success && telemetry.fallback_attempts > 0) entry.fallback_wins += 1;
   metrics.provider_distribution.set(provider, entry);
   if (telemetry.routed_model) metrics.routed_model_distribution.set(telemetry.routed_model, (metrics.routed_model_distribution.get(telemetry.routed_model) || 0) + 1);
 }
 
-function addTokenMetrics(metrics, result) {
+function addTokenMetrics(metrics, result, reportCount) {
   metrics.prompt_tokens += result.prompt_tokens;
   metrics.output_tokens += result.output_tokens;
+  metrics.token_samples.push({ reports: reportCount, input_tokens: result.prompt_tokens, output_tokens: result.output_tokens });
   if (result.prompt_tokens_estimated) metrics.estimated_prompt_tokens += result.prompt_tokens;
   if (result.output_tokens_estimated) metrics.estimated_output_tokens += result.output_tokens;
 }
@@ -530,8 +530,12 @@ function firstNumber(values) {
   return null;
 }
 
-function isTruthy(value) {
-  return ["1", "true", "yes"].includes(String(value || "").toLowerCase());
+function parseRoutedVia(value) {
+  const route = String(value || "").trim();
+  if (!route) return { provider: null, model: null };
+  const slash = route.indexOf("/");
+  if (slash < 0) return { provider: route, model: null };
+  return { provider: route.slice(0, slash) || null, model: route.slice(slash + 1) || null };
 }
 
 function compareWithProductionRelationships(batch, decisions, metrics) {
@@ -721,6 +725,67 @@ function median(values) {
   const sorted = [...values].sort((left, right) => left - right);
   const middle = Math.floor(sorted.length / 2);
   return sorted.length % 2 === 0 ? Number(((sorted[middle - 1] + sorted[middle]) / 2).toFixed(2)) : Number(sorted[middle].toFixed(2));
+}
+
+function percentile(values, fraction) {
+  if (values.length === 0) return null;
+  const sorted = [...values].sort((left, right) => left - right);
+  const index = Math.min(sorted.length - 1, Math.max(0, Math.ceil(sorted.length * fraction) - 1));
+  return Number(sorted[index].toFixed(2));
+}
+
+function buildProductionProjection(rows, events, metrics, observedTotalCalls) {
+  const reportsPerHour = 341;
+  const windowsPerHour = 12;
+  const reportsPerWindow = reportsPerHour / windowsPerHour;
+  const reportPayloadSizes = rows.map((report) => JSON.stringify(compactReport(report)).length);
+  const averageReportPayloadChars = average(reportPayloadSizes) || 0;
+  const activeEventPromptChars = buildUserPrompt([], events, "primary").length;
+  const fixedPromptChars = INTELLIGENCE_SYSTEM_PROMPT.length + activeEventPromptChars;
+  const availableReportChars = Math.max(0, MAX_PAYLOAD_CHARS - fixedPromptChars);
+  const payloadReportCapacity = averageReportPayloadChars > 0
+    ? Math.max(1, Math.floor(availableReportChars / averageReportPayloadChars))
+    : MAX_REPORTS_PER_BATCH;
+  const effectiveReportsPerBatch = Math.max(1, Math.min(MAX_REPORTS_PER_BATCH, payloadReportCapacity, reportsPerWindow));
+  const batchesPerWindow = Math.max(1, Math.ceil(reportsPerWindow / effectiveReportsPerBatch));
+  const primaryCallsPerHour = windowsPerHour * batchesPerWindow;
+  const secondPassRate = metrics.primary_calls === 0 ? 0 : metrics.second_pass_calls / metrics.primary_calls;
+  const secondPassCallsPerHour = primaryCallsPerHour * secondPassRate;
+  const averageFallbackAttemptsPerRequest = observedTotalCalls === 0 ? 0 : metrics.fallback_attempts / observedTotalCalls;
+  const fallbackOverheadPerHour = (primaryCallsPerHour + secondPassCallsPerHour) * averageFallbackAttemptsPerRequest;
+  const totalNebulaCallsPerHour = primaryCallsPerHour + secondPassCallsPerHour + fallbackOverheadPerHour;
+  const totalTokenReports = metrics.token_samples.reduce((sum, sample) => sum + sample.reports, 0);
+  const inputTokensPerReport = totalTokenReports === 0 ? 0 : metrics.token_samples.reduce((sum, sample) => sum + sample.input_tokens, 0) / totalTokenReports;
+  const outputTokensPerReport = totalTokenReports === 0 ? 0 : metrics.token_samples.reduce((sum, sample) => sum + sample.output_tokens, 0) / totalTokenReports;
+  const intelligenceCallsPerHour = primaryCallsPerHour + secondPassCallsPerHour;
+  const inputTokensPerHour = intelligenceCallsPerHour * effectiveReportsPerBatch * inputTokensPerReport;
+  const outputTokensPerHour = intelligenceCallsPerHour * effectiveReportsPerBatch * outputTokensPerReport;
+
+  return {
+    reports_per_hour: reportsPerHour,
+    windows_per_hour: windowsPerHour,
+    reports_per_window: Number(reportsPerWindow.toFixed(3)),
+    max_reports_per_batch: MAX_REPORTS_PER_BATCH,
+    average_report_payload_chars: averageReportPayloadChars,
+    active_event_prompt_chars: activeEventPromptChars,
+    fixed_prompt_chars: fixedPromptChars,
+    payload_report_capacity: payloadReportCapacity,
+    effective_reports_per_batch: Number(effectiveReportsPerBatch.toFixed(3)),
+    batches_per_window: batchesPerWindow,
+    primary_calls_per_hour: Number(primaryCallsPerHour.toFixed(3)),
+    second_pass_calls_per_hour: Number(secondPassCallsPerHour.toFixed(3)),
+    fallback_overhead_per_hour: Number(fallbackOverheadPerHour.toFixed(3)),
+    total_nebula_calls_per_hour: Number(totalNebulaCallsPerHour.toFixed(3)),
+    input_tokens_per_hour: Number(inputTokensPerHour.toFixed(3)),
+    output_tokens_per_hour: Number(outputTokensPerHour.toFixed(3)),
+    primary_calls_per_day: Number((primaryCallsPerHour * 24).toFixed(3)),
+    total_calls_per_day: Number((totalNebulaCallsPerHour * 24).toFixed(3)),
+    input_tokens_per_day: Number((inputTokensPerHour * 24).toFixed(3)),
+    output_tokens_per_day: Number((outputTokensPerHour * 24).toFixed(3)),
+    request_reduction_vs_341_individual_calls: Number((1 - totalNebulaCallsPerHour / reportsPerHour).toFixed(4)),
+    radar_http_request_reduction_vs_341: Number((1 - (primaryCallsPerHour + secondPassCallsPerHour) / reportsPerHour).toFixed(4)),
+    token_projection_basis: "successful backtest usage divided by reports represented, then scaled to effective target batch size"
+  };
 }
 
 function parseOutput(body) {

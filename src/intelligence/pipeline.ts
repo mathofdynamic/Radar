@@ -10,7 +10,7 @@ import {
 } from "../db";
 import { normalizePersianText, lexicalOverlap } from "../normalization";
 import type { EditorialBatchJob, IntelligenceBatchJob } from "../queue";
-import { generateNebulaJson, NebulaError, type NebulaJsonResult } from "./ai";
+import { generateNebulaJson, NebulaError, type NebulaJsonResult, type NebulaUsage } from "./ai";
 import { ANALYSIS_STALE_AFTER_MS, floorFiveMinuteWindow, normalizeLegacyAnalysisStatus } from "./analysis-state";
 import { ambiguousPostIds, replaceAmbiguousDecisions, validateIntelligenceDecisions } from "./decision";
 import { extractEntityKeys, inferCategory } from "./similarity";
@@ -114,7 +114,7 @@ export async function enqueueIntelligenceBatch(env: Env, scheduledAt: string, fo
        model_requested, attempts, prompt_tokens, completion_tokens, created_at, updated_at
      ) VALUES (?, ?, ?, ?, 'queued', 0, ?, 0, 0, 0, ?, ?)
      ON CONFLICT(batch_key) DO NOTHING`
-  ).bind(batchKey, window.start, window.end, sequence, config.nebulaModel, createdAt, createdAt).run();
+  ).bind(batchKey, window.start, window.end, sequence, config.nebulaIntelligenceModel, createdAt, createdAt).run();
   const batchId = Number(result.meta.last_row_id ?? 0) || (await env.DB.prepare(
     "SELECT id FROM intelligence_batches WHERE batch_key = ?"
   ).bind(batchKey).first<{ id: number }>())?.id;
@@ -215,8 +215,7 @@ export async function processIntelligenceBatch(env: Env, job: IntelligenceBatchJ
     const knownEventIds = new Set(activeEvents.map((event) => event.event_id));
     let decisions = validateIntelligenceDecisions(primary.data, reports.map((report) => report.id), knownEventIds);
     const uncertainIds = ambiguousPostIds(decisions, config.intelligenceAmbiguityThreshold);
-    const providerNames = new Set<string>();
-    if (primary.usage.provider) providerNames.add(primary.usage.provider);
+    const nebulaUsages: NebulaUsage[] = [primary.usage];
     let promptTokens = primary.usage.promptTokens;
     let completionTokens = primary.usage.completionTokens;
 
@@ -231,7 +230,7 @@ export async function processIntelligenceBatch(env: Env, job: IntelligenceBatchJ
         new Set(reports.map((report) => report.id))
       );
       decisions = replaceAmbiguousDecisions(decisions, resolved, new Set(uncertainIds));
-      if (second.usage.provider) providerNames.add(second.usage.provider);
+      nebulaUsages.push(second.usage);
       promptTokens += second.usage.promptTokens;
       completionTokens += second.usage.completionTokens;
     }
@@ -243,7 +242,7 @@ export async function processIntelligenceBatch(env: Env, job: IntelligenceBatchJ
       new Set(reports.map((report) => report.id))
     );
     const outcome = await applyBatchDecisions(env, batch.id, reports, decisions);
-    await completeBatch(env.DB, batch.id, [...providerNames].join(",") || null, promptTokens, completionTokens);
+    await completeBatch(env.DB, batch.id, summarizeNebulaUsage(nebulaUsages), promptTokens, completionTokens);
     await safeIncrementCounter(env.DB, "intelligence_batches");
     await safeIncrementCounter(env.DB, "intelligence_reports_processed", reports.length);
     if (outcome.newEvents > 0) await safeIncrementCounter(env.DB, "intelligence_new_events", outcome.newEvents);
@@ -407,12 +406,28 @@ async function getBatch(db: D1Database, batchId: number): Promise<IntelligenceBa
   return db.prepare("SELECT * FROM intelligence_batches WHERE id = ?").bind(batchId).first<IntelligenceBatchRow>();
 }
 
-async function completeBatch(db: D1Database, batchId: number, provider: string | null, promptTokens: number, completionTokens: number): Promise<void> {
+async function completeBatch(db: D1Database, batchId: number, telemetry: string | null, promptTokens: number, completionTokens: number): Promise<void> {
   const timestamp = new Date().toISOString();
   await db.prepare(
     `UPDATE intelligence_batches SET status = 'completed', provider_used = ?, prompt_tokens = ?, completion_tokens = ?,
        lease_at = NULL, error = NULL, completed_at = ?, updated_at = ? WHERE id = ?`
-  ).bind(provider, promptTokens, completionTokens, timestamp, timestamp, batchId).run();
+  ).bind(telemetry, promptTokens, completionTokens, timestamp, timestamp, batchId).run();
+}
+
+function summarizeNebulaUsage(usages: NebulaUsage[]): string | null {
+  if (usages.length === 0) return null;
+  return JSON.stringify({
+    requests: usages.map((usage) => ({
+      requested_model: usage.requestedModel,
+      model: usage.model,
+      provider: usage.provider,
+      routed_model: usage.routedModel,
+      fallback_attempts: usage.fallbackAttempts,
+      request_id: usage.requestId,
+      status: usage.status,
+      latency_ms: usage.latencyMs
+    }))
+  });
 }
 
 async function releaseBatchReports(db: D1Database, batchId: number, error: string): Promise<void> {
