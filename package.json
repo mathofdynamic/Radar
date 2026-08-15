@@ -12,6 +12,7 @@
     "types:check": "wrangler types --include-runtime false --check",
     "lint": "tsc --noEmit",
     "backtest": "node scripts/v8-backtest.mjs",
+    "backtest:manifest": "node scripts/v8-create-manifest.mjs",
     "typecheck": "tsc --noEmit",
     "test": "vitest run",
     "test:watch": "vitest",

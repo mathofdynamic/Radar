@@ -1,4 +1,5 @@
 import { spawnSync } from "node:child_process";
+import fs from "node:fs";
 import path from "node:path";
 import intelligenceBatchJsonSchema from "../src/intelligence/intelligence-json-schema.json" with { type: "json" };
 
@@ -13,6 +14,11 @@ const MAX_PAYLOAD_CHARS = 60_000;
 const AMBIGUITY_THRESHOLD = 0.72;
 const REQUEST_TIMEOUT_MS = Math.max(5_000, Number(process.env.RADAR_BACKTEST_REQUEST_TIMEOUT_MS || 95_000));
 const MAX_CONCURRENT_BATCHES = Math.max(1, Math.min(8, Number(process.env.RADAR_BACKTEST_CONCURRENCY || 1)));
+const EVENT_CAP = Math.max(1, Math.min(40, Number(process.env.RADAR_EVENT_CAP || 40)));
+const BACKTEST_MODE = process.env.RADAR_BACKTEST_MODE || "baseline";
+const QUEUE_REPLAY_ENABLED = process.env.RADAR_BACKTEST_QUEUE_REPLAY !== "0";
+const BASELINE_MANIFEST_PATH = path.resolve(process.cwd(), "scripts", "fixtures", "v8-baseline-500.json");
+const DIAGNOSTIC_ROOT = path.resolve(process.cwd(), "diagnostics", "v8");
 const REVIEW_TEXT_CHARS = 320;
 const REVIEW_STOP_WORDS = new Set(["the", "and", "for", "with", "from", "that", "this", "در", "از", "به", "با", "برای", "که", "این", "آن"]);
 const CATEGORIES = new Set(["IRAN", "WORLD", "POLITICS", "WAR_SECURITY", "SOCIETY", "ECONOMY", "TECHNOLOGY"]);
@@ -29,10 +35,13 @@ Return exactly one JSON object with a decisions array and no Markdown.`;
 
 const BASELINE_SAMPLE_START = "2026-08-13T20:37:52.000Z";
 const BASELINE_SAMPLE_END = "2026-08-14T07:55:01.000Z";
-const SAMPLE_FILTER = SAMPLE === "baseline-v8-500"
-  ? `AND COALESCE(rp.published_at, rp.observed_at) >= '${BASELINE_SAMPLE_START}'
-      AND COALESCE(rp.published_at, rp.observed_at) <= '${BASELINE_SAMPLE_END}'`
-  : "";
+const BASELINE_MANIFEST = SAMPLE === "baseline-v8-500" ? loadBaselineManifest() : null;
+const SAMPLE_FILTER = BASELINE_MANIFEST
+  ? `AND rp.id IN (${BASELINE_MANIFEST.post_ids.join(",")})`
+  : SAMPLE === "baseline-v8-500"
+    ? `AND COALESCE(rp.published_at, rp.observed_at) >= '${BASELINE_SAMPLE_START}'
+        AND COALESCE(rp.published_at, rp.observed_at) <= '${BASELINE_SAMPLE_END}'`
+    : "";
 
 function scopeIntelligenceBatchJsonSchema(allowedPostIds, allowedEventIds, duplicateTargetPostIds = allowedPostIds) {
   const schema = JSON.parse(JSON.stringify(intelligenceBatchJsonSchema));
@@ -52,6 +61,21 @@ function scopeIntelligenceBatchJsonSchema(allowedPostIds, allowedEventIds, dupli
 
 function uniquePositiveIds(values) {
   return [...new Set(values)].filter((value) => Number.isSafeInteger(value) && value > 0).sort((left, right) => left - right);
+}
+
+function loadBaselineManifest() {
+  if (!fs.existsSync(BASELINE_MANIFEST_PATH)) return null;
+  const parsed = JSON.parse(fs.readFileSync(BASELINE_MANIFEST_PATH, "utf8"));
+  const postIds = Array.isArray(parsed?.post_ids) ? parsed.post_ids.map(Number) : [];
+  const uniqueIds = uniquePositiveIds(postIds);
+  if (uniqueIds.length !== 500 || postIds.length !== 500) {
+    throw new Error(`baseline_manifest_invalid:expected_500_unique_post_ids:${uniqueIds.length}`);
+  }
+  return {
+    version: Number(parsed.version || 1),
+    post_ids: postIds,
+    windows: Array.isArray(parsed.windows) ? parsed.windows : []
+  };
 }
 
 if (!API_KEY) {
@@ -74,7 +98,7 @@ const reports = queryD1(`
    GROUP BY rp.id
    ORDER BY COALESCE(rp.published_at, rp.observed_at) DESC, rp.id DESC
    LIMIT ${SAMPLE_LIMIT}
-`).map((row) => ({
+ `).map((row) => ({
   id: Number(row.id),
   source_id: Number(row.source_id),
   source_name: String(row.source_name || ""),
@@ -86,13 +110,27 @@ const reports = queryD1(`
   raw_metadata_json: String(row.raw_metadata_json || "{}"),
   text: String(row.text || "").slice(0, MAX_REPORT_CHARS),
   event_ids: new Set(parseIntegerList(row.event_ids)),
-  origin_groups: new Set(parseStringList(row.origin_groups))
-})).filter((row) => Number.isSafeInteger(row.id) && row.text.length > 0);
+   origin_groups: new Set(parseStringList(row.origin_groups))
+ })).filter((row) => Number.isSafeInteger(row.id) && row.text.length > 0);
 
+if (BASELINE_MANIFEST) {
+  const reportIds = new Set(reports.map((report) => report.id));
+  const missingIds = BASELINE_MANIFEST.post_ids.filter((postId) => !reportIds.has(postId));
+  if (reports.length !== 500 || missingIds.length > 0 || reportIds.size !== 500) {
+    throw new Error(`baseline_manifest_data_mismatch:rows=${reports.length}:missing=${missingIds.slice(0, 10).join(",")}`);
+  }
+}
 if (reports.length < 500) {
   console.error(`BACKTEST_BLOCKED: only ${reports.length} usable non-noise reports were returned; at least 500 are required when available.`);
   process.exit(3);
 }
+
+const replayDates = reports.map((report) => Date.parse(report.published_at || report.observed_at)).filter(Number.isFinite);
+const replayStart = new Date(Math.min(...replayDates));
+const replayEnd = new Date(Math.max(...replayDates));
+const replayStartIso = replayStart.toISOString();
+const replayEndIso = replayEnd.toISOString();
+const eventEligibilityStartIso = new Date(replayStart.getTime() - 48 * 60 * 60 * 1_000).toISOString();
 
 const activeEvents = queryD1(`
   SELECT e.id AS event_id, e.core_fact, e.category, e.first_seen_at, e.last_updated_at,
@@ -101,11 +139,11 @@ const activeEvents = queryD1(`
     FROM events e
     LEFT JOIN event_sources es ON es.event_id = e.id
     LEFT JOIN sources s ON s.id = es.source_id
-   WHERE e.event_state = 'active'
-     AND e.last_updated_at >= datetime('now', '-48 hours')
+   WHERE e.first_seen_at <= '${replayEndIso}'
+     AND e.last_updated_at >= '${eventEligibilityStartIso}'
    GROUP BY e.id
    ORDER BY e.last_updated_at DESC
-   LIMIT 40
+   LIMIT 500
 `).map((row) => ({
   event_id: Number(row.event_id),
   core_fact: String(row.core_fact || "").slice(0, 800),
@@ -117,8 +155,9 @@ const activeEvents = queryD1(`
   independent_confirmation_count: Number(row.independent_confirmation_count || 0)
 })).filter((row) => Number.isSafeInteger(row.event_id));
 
-const batches = buildBatches(reports);
-const knownEventIds = new Set(activeEvents.map((event) => event.event_id));
+const batches = BASELINE_MANIFEST?.windows?.length
+  ? buildManifestBatches(reports, BASELINE_MANIFEST.windows)
+  : buildBatches(reports);
 const metrics = {
   reports_tested: reports.length,
   windows: new Set(batches.map((batch) => batch.window_end)).size,
@@ -174,6 +213,13 @@ const metrics = {
   failed_batches: 0,
   second_pass_failures: 0,
   copied_source_cases: 0,
+  active_event_counts: [],
+  failed_batch_artifacts: [],
+  second_pass_cases: [],
+  queue_replay: [],
+  duplicate_forensics: [],
+  provider_final_samples: [],
+  initial_gateway_forensics: [],
   request_telemetry: [],
   initial_latency_samples: [],
   end_to_end_latency_samples: [],
@@ -192,25 +238,61 @@ const metrics = {
   }
 };
 
+if (BACKTEST_MODE === "high-density") {
+  const highDensity = await runHighDensityExperiment(reports, activeEvents, EVENT_CAP);
+  fs.mkdirSync(DIAGNOSTIC_ROOT, { recursive: true });
+  fs.writeFileSync(path.join(DIAGNOSTIC_ROOT, `high-density-cap-${EVENT_CAP}.json`), `${JSON.stringify(highDensity, null, 2)}\n`, "utf8");
+  console.log(JSON.stringify({
+    mode: BACKTEST_MODE,
+    event_cap: EVENT_CAP,
+    reports_per_request: 28,
+    ...highDensity,
+    mutation: "none"
+  }, null, 2));
+  process.exit(0);
+}
+
 for (let batchStart = 0; batchStart < batches.length; batchStart += MAX_CONCURRENT_BATCHES) {
   const concurrentBatches = batches.slice(batchStart, batchStart + MAX_CONCURRENT_BATCHES);
   await Promise.all(concurrentBatches.map((batch, offset) => processBatch(batch, batchStart + offset)));
 }
 
+if (QUEUE_REPLAY_ENABLED) {
+  metrics.queue_replay = await replayGatewayFailures(metrics.failed_batch_artifacts);
+}
+
 async function processBatch(batch, batchIndex) {
   const batchStartedAt = Date.now();
   const correctionState = { used: false };
+  const batchEvents = selectEventsForBatch(activeEvents, batch, EVENT_CAP);
+  const knownEventIds = new Set(batchEvents.map((event) => event.event_id));
+  metrics.active_event_counts.push(batchEvents.length);
+  const diagnostic = {
+    batch: {
+      window_start: batch.window_start,
+      window_end: batch.window_end,
+      report_ids: batch.reports.map((report) => report.id),
+      report_count: batch.reports.length
+    },
+    active_event_ids: batchEvents.map((event) => event.event_id),
+    attempts: [],
+    validation_errors: []
+  };
   let decisions;
   let primaryCallCompleted = false;
   try {
     metrics.primary_calls += 1;
-    const primary = await callNebula(batch.reports, activeEvents, "primary");
+    const primary = await callNebula(batch.reports, batchEvents, "primary");
+    diagnostic.attempts.push(...primary.attempts);
+    diagnostic.request_payload = primary.request_payload;
+    diagnostic.primary_output = primary.output;
+    recordInitialGatewayForensics(metrics, batch, batchEvents, primary, null);
     recordCallResult(metrics, primary, null, "primary");
     addTokenMetricsFromCall(metrics, primary, "primary");
     primaryCallCompleted = true;
     const primaryValidation = await validateWithCorrection(
       batch.reports,
-      activeEvents,
+      batchEvents,
       primary.output,
       batch.reports.map((report) => report.id),
       knownEventIds,
@@ -220,10 +302,16 @@ async function processBatch(batch, batchIndex) {
     );
     decisions = primaryValidation.decisions;
   } catch (error) {
+    diagnostic.validation_errors.push(error instanceof Error ? error.message : String(error));
+    if (error?.correctionOutput) diagnostic.correction_output = error.correctionOutput;
+    if (error?.attempts) diagnostic.attempts.push(...error.attempts);
+    if (error?.request_payload && !diagnostic.request_payload) diagnostic.request_payload = error.request_payload;
+    recordInitialGatewayForensics(metrics, batch, batchEvents, null, error);
     if (!primaryCallCompleted) recordCallResult(metrics, null, error, "primary");
     metrics.failed_batches += 1;
     metrics.final_logical_batches_failed += 1;
     recordRejectedResponse(metrics, error);
+    recordFailedBatchArtifact(diagnostic, error);
     console.warn(`BACKTEST_BATCH_FAILED window=${batch.window_end} reports=${batch.reports.length} error=${error instanceof Error ? error.message : String(error)}`);
     return;
   }
@@ -232,7 +320,7 @@ async function processBatch(batch, batchIndex) {
 
   if (uncertainIds.length > 0) {
     const focusedReports = batch.reports.filter((report) => uncertainIds.includes(report.id));
-    const focusedEvents = activeEvents.filter((event) => decisions.some((decision) => decision.event_id === event.event_id && decision.post_ids.some((id) => uncertainIds.includes(id)))).slice(0, 5);
+    const focusedEvents = batchEvents.filter((event) => decisions.some((decision) => decision.event_id === event.event_id && decision.post_ids.some((id) => uncertainIds.includes(id)))).slice(0, 5);
     let secondCallCompleted = false;
     try {
       metrics.second_pass_calls += 1;
@@ -240,6 +328,13 @@ async function processBatch(batch, batchIndex) {
         expectedPostIds: uncertainIds,
         duplicateTargetPostIds: batch.reports.map((report) => report.id)
       });
+      diagnostic.attempts.push(...second.attempts);
+      diagnostic.request_payload = diagnostic.request_payload || second.request_payload;
+      diagnostic.second_pass = {
+        uncertain_post_ids: uncertainIds,
+        resolved_post_ids: [],
+        output: second.output
+      };
       recordCallResult(metrics, second, null, "ambiguity");
       addTokenMetricsFromCall(metrics, second, "ambiguity");
       secondCallCompleted = true;
@@ -258,12 +353,30 @@ async function processBatch(batch, batchIndex) {
       decisions = [...decisions.filter((decision) => !decision.post_ids.some((id) => resolvedIds.has(id))), ...resolved];
       const finalUncertainIds = new Set(decisions.filter((decision) => decision.action === "UNCERTAIN" || decision.confidence < AMBIGUITY_THRESHOLD).flatMap((decision) => decision.post_ids));
       metrics.resolved_second_pass += [...resolvedIds].filter((id) => !finalUncertainIds.has(id)).length;
+      diagnostic.second_pass.resolved_post_ids = [...resolvedIds].filter((id) => !finalUncertainIds.has(id));
+      diagnostic.second_pass.final_decisions = resolved;
+      metrics.second_pass_cases.push({
+        window_end: batch.window_end,
+        uncertain_post_ids: uncertainIds,
+        resolved_post_ids: diagnostic.second_pass.resolved_post_ids,
+        final_decisions: resolved.map((decision) => ({
+          post_ids: decision.post_ids,
+          action: decision.action,
+          event_id: decision.event_id,
+          confidence: decision.confidence
+        }))
+      });
     } catch (error) {
+      diagnostic.validation_errors.push(error instanceof Error ? error.message : String(error));
+      if (error?.correctionOutput) diagnostic.correction_output = error.correctionOutput;
+      if (error?.attempts) diagnostic.attempts.push(...error.attempts);
+      if (error?.request_payload && !diagnostic.request_payload) diagnostic.request_payload = error.request_payload;
       metrics.second_pass_failures += 1;
       if (!secondCallCompleted) recordCallResult(metrics, null, error, "ambiguity");
       metrics.failed_batches += 1;
       metrics.final_logical_batches_failed += 1;
       recordRejectedResponse(metrics, error);
+      recordFailedBatchArtifact(diagnostic, error);
       console.warn(`AMBIGUITY_OUTPUT_REJECTED: ${error instanceof Error ? error.message : String(error)}`);
       return;
     }
@@ -272,7 +385,7 @@ async function processBatch(batch, batchIndex) {
   try {
     const finalValidation = await validateWithCorrection(
       batch.reports,
-      activeEvents,
+      batchEvents,
       { decisions },
       batch.reports.map((report) => report.id),
       knownEventIds,
@@ -282,9 +395,14 @@ async function processBatch(batch, batchIndex) {
     );
     decisions = finalValidation.decisions;
   } catch (error) {
+    diagnostic.validation_errors.push(error instanceof Error ? error.message : String(error));
+    if (error?.correctionOutput) diagnostic.correction_output = error.correctionOutput;
+    if (error?.attempts) diagnostic.attempts.push(...error.attempts);
+    if (error?.request_payload && !diagnostic.request_payload) diagnostic.request_payload = error.request_payload;
     metrics.failed_batches += 1;
     metrics.final_logical_batches_failed += 1;
     recordRejectedResponse(metrics, error);
+    recordFailedBatchArtifact(diagnostic, error);
     console.warn(`FINAL_OUTPUT_REJECTED: ${error instanceof Error ? error.message : String(error)}`);
     return;
   }
@@ -314,8 +432,9 @@ async function validateWithCorrection(batchReports, events, output, expectedPost
     metrics.correction_calls += 1;
     metrics.contract_correction_calls += 1;
     let correctionCallCompleted = false;
+    let correction = null;
     try {
-      const correction = await callNebula(batchReports, events, "correction", {
+      correction = await callNebula(batchReports, events, "correction", {
         expectedPostIds,
         duplicateTargetPostIds: [...allowedPostIds],
         priorDecisions: output?.decisions || [],
@@ -328,6 +447,11 @@ async function validateWithCorrection(batchReports, events, output, expectedPost
       metrics.contract_correction_successes += 1;
       return { decisions };
     } catch (correctionError) {
+      if (correction && correctionError && typeof correctionError === "object") {
+        correctionError.correctionOutput = correction.output;
+        correctionError.attempts = correction.attempts;
+        correctionError.request_payload = correction.request_payload;
+      }
       if (!correctionCallCompleted) recordCallResult(metrics, null, correctionError, "correction");
       metrics.contract_correction_failures += 1;
       throw correctionError;
@@ -347,9 +471,27 @@ const latencies = metrics.request_telemetry.map((request) => request.latency_ms)
 const initialLatencies = metrics.initial_latency_samples.filter((value) => Number.isFinite(value));
 const endToEndLatencies = metrics.end_to_end_latency_samples.filter((value) => Number.isFinite(value));
 const productionProjection = buildProductionProjection(reports, activeEvents, metrics, totalCalls);
+const failedBatchForensics = metrics.failed_batch_artifacts.map((artifact) => ({
+  window_end: artifact.window_end,
+  report_ids: artifact.report_ids,
+  report_count: artifact.report_count,
+  active_event_count: artifact.active_event_count,
+  active_event_ids: artifact.active_event_ids,
+  prompt_chars: artifact.prompt_chars,
+  system_prompt_chars: artifact.system_prompt_chars,
+  schema_chars: artifact.schema_chars,
+  request_ids: artifact.request_ids,
+  attempts: artifact.attempts,
+  failure_category: artifact.failure_category,
+  validation_errors: artifact.validation_errors,
+  duplicate_forensics: artifact.duplicate_forensics
+}));
+const duplicateForensics = failedBatchForensics.flatMap((artifact) => artifact.duplicate_forensics.map((item) => ({ window_end: artifact.window_end, ...item })));
 console.log(JSON.stringify({
   sample_selection: SAMPLE,
-  baseline_selection_exactness: SAMPLE === "baseline-v8-500" ? "deterministic_date_bounded_reconstruction" : "latest_ordered_sample",
+  baseline_selection_exactness: BASELINE_MANIFEST ? "canonical_manifest" : SAMPLE === "baseline-v8-500" ? "deterministic_date_bounded_reconstruction" : "latest_ordered_sample",
+  baseline_manifest_file: BASELINE_MANIFEST ? path.relative(process.cwd(), BASELINE_MANIFEST_PATH) : null,
+  baseline_manifest_reports: BASELINE_MANIFEST?.post_ids.length ?? null,
   reports_tested: metrics.reports_tested,
   windows: metrics.windows,
   batches: metrics.batches,
@@ -413,6 +555,19 @@ console.log(JSON.stringify({
   rejected_unsafe_responses: metrics.rejected_unsafe_responses,
   second_pass_failures: metrics.second_pass_failures,
   copied_source_cases: metrics.copied_source_cases,
+  event_context: {
+    cap: EVENT_CAP,
+    shortlist_method: EVENT_CAP >= 40 ? "historical eligibility then last_updated_at descending" : "token overlap plus category compatibility plus recency",
+    historical_filter: "first_seen_at <= batch.window_end AND last_updated_at >= batch.window_end - 48h",
+    active_event_counts: { median: median(metrics.active_event_counts), maximum: Math.max(...metrics.active_event_counts, 0) },
+    current_core_fact_limitation: "event rows are current snapshots; historical event-version changes are unavailable"
+  },
+  failed_batch_forensics: failedBatchForensics,
+  initial_gateway_forensics: metrics.initial_gateway_forensics,
+  duplicate_forensics: duplicateForensics,
+  provider_behavior: summarizeProviderBehavior(metrics.request_telemetry),
+  second_pass_cases: metrics.second_pass_cases,
+  queue_equivalent_replay: metrics.queue_replay,
   manual_review: metrics.manual_review,
   production_projection_at_341_reports_per_hour: productionProjection,
   observed_calls_per_hour: sampleDurationHours === null ? null : Number((totalCalls / sampleDurationHours).toFixed(3)),
@@ -457,12 +612,233 @@ function buildBatches(rows) {
   return batches;
 }
 
+function buildManifestBatches(rows, manifestWindows) {
+  const byId = new Map(rows.map((report) => [report.id, report]));
+  const batches = [...manifestWindows].sort((left, right) => String(left.window_end).localeCompare(String(right.window_end))).map((window) => {
+    const windowReports = window.post_ids.map((postId) => byId.get(Number(postId))).filter(Boolean);
+    if (windowReports.length !== window.post_ids.length) throw new Error(`baseline_manifest_window_missing:${window.window_end}`);
+    const windowEnd = String(window.window_end);
+    return {
+      window_start: new Date(Date.parse(windowEnd) - 5 * 60 * 1_000).toISOString(),
+      window_end: windowEnd,
+      reports: windowReports
+    };
+  });
+  if (batches.reduce((sum, batch) => sum + batch.reports.length, 0) !== rows.length) throw new Error("baseline_manifest_window_coverage_invalid");
+  return batches;
+}
+
+function selectEventsForBatch(events, batch, cap) {
+  const windowEndMs = Date.parse(batch.window_end);
+  const historicalEligible = events.filter((event) => {
+    const firstSeenMs = Date.parse(event.first_seen_at);
+    const lastUpdatedMs = Date.parse(event.last_updated_at);
+    return Number.isFinite(firstSeenMs)
+      && Number.isFinite(lastUpdatedMs)
+      && firstSeenMs <= windowEndMs
+      && lastUpdatedMs >= windowEndMs - 48 * 60 * 60 * 1_000;
+  });
+  if (cap >= 40) return historicalEligible
+    .sort((left, right) => right.last_updated_at.localeCompare(left.last_updated_at) || right.event_id - left.event_id)
+    .slice(0, cap);
+
+  const reportText = batch.reports.map((report) => report.text).join(" ");
+  const reportTokens = tokenSet(reportText);
+  const reportCategoryHints = categoryHints(reportText);
+  return historicalEligible
+    .map((event) => {
+      const eventTokens = tokenSet(`${event.core_fact} ${event.source_names}`);
+      const overlap = [...eventTokens].filter((token) => reportTokens.has(token)).length;
+      const categoryBoost = reportCategoryHints.has(event.category) ? 4 : 0;
+      const ageHours = Math.max(0, (windowEndMs - Date.parse(event.last_updated_at)) / 3_600_000);
+      const recencyBoost = 1 / (1 + ageHours / 24);
+      return { event, score: overlap * 10 + categoryBoost + recencyBoost };
+    })
+    .sort((left, right) => right.score - left.score || right.event.last_updated_at.localeCompare(left.event.last_updated_at) || right.event.event_id - left.event.event_id)
+    .slice(0, cap)
+    .map((item) => item.event);
+}
+
+function tokenSet(text) {
+  return new Set(String(text || "").toLocaleLowerCase().split(/[^\p{L}\p{N}]+/u).filter((token) => token.length >= 3 && !REVIEW_STOP_WORDS.has(token)));
+}
+
+function categoryHints(text) {
+  const value = String(text || "");
+  const hints = new Set();
+  if (/جنگ|حمله|انفجار|موشک|ارتش|نظامی|war|attack|missile/iu.test(value)) hints.add("WAR_SECURITY");
+  if (/دولت|رئیس|ترامپ|انتخابات|پارلمان|سیاست|government|president|election/iu.test(value)) hints.add("POLITICS");
+  if (/اقتصاد|بازار|نفت|دلار|بانک|economy|market|oil/iu.test(value)) hints.add("ECONOMY");
+  if (/فناوری|اینترنت|هوش مصنوعی|تکنولوژی|technology|software/iu.test(value)) hints.add("TECHNOLOGY");
+  if (/ایران|تهران|خوزستان|هرمز|Iran|Tehran/iu.test(value)) hints.add("IRAN");
+  return hints;
+}
+
+function recordFailedBatchArtifact(diagnostic, error) {
+  const attempts = diagnostic.attempts.map((attempt) => ({
+    request_id: attempt.telemetry?.request_id ?? null,
+    status: attempt.telemetry?.status ?? null,
+    provider: attempt.telemetry?.provider ?? null,
+    routed_model: attempt.telemetry?.routed_model ?? null,
+    fallback_attempts: attempt.telemetry?.fallback_attempts ?? 0,
+    latency_ms: attempt.telemetry?.latency_ms ?? null,
+    logical_attempt: attempt.telemetry?.logical_attempt ?? null,
+    logical_retry: attempt.telemetry?.logical_retry ?? false,
+    prompt_chars: attempt.telemetry?.prompt_chars ?? null,
+    system_prompt_chars: attempt.telemetry?.system_prompt_chars ?? null,
+    schema_chars: attempt.telemetry?.schema_chars ?? null,
+    active_event_count: attempt.telemetry?.active_event_count ?? null,
+    prompt_tokens: attempt.prompt_tokens ?? 0,
+    output_tokens: attempt.output_tokens ?? 0,
+    structured_json: attempt.structured_json ?? false
+  }));
+  const artifact = {
+    ...diagnostic.batch,
+    active_event_ids: diagnostic.active_event_ids,
+    prompt_chars: attempts.find((attempt) => attempt.prompt_chars !== null)?.prompt_chars ?? null,
+    system_prompt_chars: attempts.find((attempt) => attempt.system_prompt_chars !== null)?.system_prompt_chars ?? null,
+    schema_chars: attempts.find((attempt) => attempt.schema_chars !== null)?.schema_chars ?? null,
+    active_event_count: diagnostic.active_event_ids.length,
+    request_ids: attempts.map((attempt) => attempt.request_id).filter(Boolean),
+    attempts,
+    request_payload: diagnostic.request_payload ?? null,
+    failure_category: error?.backtestCode || error?.message || "unknown",
+    validation_errors: diagnostic.validation_errors,
+    primary_output: diagnostic.primary_output ?? null,
+    correction_output: diagnostic.correction_output ?? null,
+    second_pass: diagnostic.second_pass ?? null,
+    duplicate_forensics: classifyDuplicateGraphs([diagnostic.primary_output, diagnostic.correction_output].filter(Boolean), diagnostic.batch.report_ids)
+  };
+  metrics.failed_batch_artifacts.push(artifact);
+  fs.mkdirSync(DIAGNOSTIC_ROOT, { recursive: true });
+  const safeName = `${diagnostic.batch.window_end.replace(/[^0-9A-Za-z-]+/gu, "_")}-${diagnostic.batch.report_ids[0] || "batch"}.json`;
+  fs.writeFileSync(path.join(DIAGNOSTIC_ROOT, `failed-${safeName}`), `${JSON.stringify(artifact, null, 2)}\n`, "utf8");
+  diagnostic.duplicate_forensics = artifact.duplicate_forensics;
+}
+
+function classifyDuplicateGraphs(outputs, allowedPostIds) {
+  const allowed = new Set(allowedPostIds);
+  return outputs.flatMap((output) => {
+    const decisions = Array.isArray(output?.decisions) ? output.decisions : [];
+    const actionByPost = new Map();
+    const targetByPost = new Map();
+    for (const decision of decisions) {
+      for (const postId of Array.isArray(decision?.post_ids) ? decision.post_ids : []) actionByPost.set(Number(postId), decision.action);
+      if (decision?.action === "DUPLICATE" && Array.isArray(decision.post_ids)) {
+        for (const postId of decision.post_ids) targetByPost.set(Number(postId), Number(decision.duplicate_of_post_id));
+      }
+    }
+    return [...targetByPost.entries()].map(([postId, target]) => {
+      let type = "F_other";
+      if (!allowed.has(target) || !actionByPost.has(target)) type = "D_missing_target";
+      else if (target === postId) type = "E_cycle";
+      else if (actionByPost.get(target) === "NOISE") type = "B_duplicate_to_noise";
+      else if (actionByPost.get(target) === "UNCERTAIN") type = "C_duplicate_to_uncertain";
+      else if (actionByPost.get(target) === "DUPLICATE") type = "A_duplicate_chain";
+      return { post_id: postId, target_post_id: target, target_action: actionByPost.get(target) || null, type };
+    });
+  });
+}
+
+async function runHighDensityExperiment(rows, events, cap) {
+  const chronological = [...rows].sort((left, right) => String(left.published_at || left.observed_at).localeCompare(String(right.published_at || right.observed_at)) || left.id - right.id);
+  const groups = [];
+  for (let index = 0; index < 10; index += 1) {
+    const start = Math.floor(index * (chronological.length - 28) / 9);
+    groups.push(chronological.slice(start, start + 28));
+  }
+  const results = [];
+  for (const group of groups) {
+    const date = new Date(group[0].published_at || group[0].observed_at);
+    date.setUTCSeconds(0, 0);
+    date.setUTCMinutes(Math.floor(date.getUTCMinutes() / 5) * 5);
+    const batch = { window_start: new Date(date.getTime() - 5 * 60 * 1_000).toISOString(), window_end: date.toISOString(), reports: group };
+    const selectedEvents = selectEventsForBatch(events, batch, cap);
+    try {
+      const result = await callNebula(group, selectedEvents, "primary");
+      const valid = validateQueueReplayOutput(result.output, { report_ids: group.map((report) => report.id), active_event_ids: selectedEvents.map((event) => event.event_id) });
+      results.push({
+        window_end: batch.window_end,
+        report_count: group.length,
+        active_event_count: selectedEvents.length,
+        valid,
+        attempts: result.attempts.map((attempt) => ({
+          status: attempt.telemetry.status,
+          provider: attempt.telemetry.provider,
+          routed_model: attempt.telemetry.routed_model,
+          fallback_attempts: attempt.telemetry.fallback_attempts,
+          request_id: attempt.telemetry.request_id,
+          latency_ms: attempt.telemetry.latency_ms,
+          prompt_chars: attempt.telemetry.prompt_chars,
+          schema_chars: attempt.telemetry.schema_chars,
+          prompt_tokens: attempt.prompt_tokens,
+          output_tokens: attempt.output_tokens
+        }))
+      });
+    } catch (error) {
+      results.push({ window_end: batch.window_end, report_count: group.length, active_event_count: selectedEvents.length, valid: false, error: error instanceof Error ? error.message : String(error), attempts: (error?.attempts || []).map((attempt) => attempt.telemetry) });
+    }
+  }
+  const attempts = results.flatMap((result) => result.attempts || []);
+  const successful = results.filter((result) => result.valid).length;
+  const finalResponses = attempts.filter((attempt) => attempt.status >= 200 && attempt.status < 300);
+  const latency = finalResponses.map((attempt) => attempt.latency_ms).filter(Number.isFinite);
+  const providers = new Map();
+  for (const attempt of finalResponses) {
+    const entry = providers.get(attempt.provider || "unknown") || { calls: 0, fallback_attempts: 0 };
+    entry.calls += 1;
+    entry.fallback_attempts += attempt.fallback_attempts || 0;
+    providers.set(attempt.provider || "unknown", entry);
+  }
+  return {
+    requests: groups.length,
+    successful,
+    failed: groups.length - successful,
+    http_successes: finalResponses.length,
+    fallback_attempts: attempts.reduce((sum, attempt) => sum + (attempt.fallback_attempts || 0), 0),
+    median_latency_ms: median(latency),
+    p95_latency_ms: percentile(latency, 0.95),
+    total_input_tokens: attempts.reduce((sum, attempt) => sum + (attempt.prompt_tokens || 0), 0),
+    total_output_tokens: attempts.reduce((sum, attempt) => sum + (attempt.output_tokens || 0), 0),
+    average_input_tokens_per_success: successful === 0 ? null : Number((attempts.filter((attempt) => attempt.status >= 200 && attempt.status < 300).reduce((sum, attempt) => sum + (attempt.prompt_tokens || 0), 0) / successful).toFixed(2)),
+    average_output_tokens_per_success: successful === 0 ? null : Number((attempts.filter((attempt) => attempt.status >= 200 && attempt.status < 300).reduce((sum, attempt) => sum + (attempt.output_tokens || 0), 0) / successful).toFixed(2)),
+    provider_distribution: [...providers.entries()].map(([provider, value]) => ({ provider, ...value })),
+    requests_detail: results
+  };
+}
+
 async function callNebula(batchReports, events, pass, options = {}) {
   const expectedPostIds = options.expectedPostIds || batchReports.map((report) => report.id);
   const duplicateTargetPostIds = options.duplicateTargetPostIds || batchReports.map((report) => report.id);
   const userPrompt = buildUserPrompt(batchReports, events, pass, options);
   if (userPrompt.length + INTELLIGENCE_SYSTEM_PROMPT.length > MAX_PAYLOAD_CHARS) throw new Error("backtest_payload_too_large");
   const responseSchema = scopeIntelligenceBatchJsonSchema(expectedPostIds, events.map((event) => event.event_id), duplicateTargetPostIds);
+  const requestPayload = {
+    model: "radar-fast",
+    messages: [
+      { role: "system", content: INTELLIGENCE_SYSTEM_PROMPT },
+      { role: "user", content: userPrompt }
+    ],
+    response_format: {
+      type: "json_schema",
+      json_schema: {
+        name: "radar_intelligence_batch",
+        strict: true,
+        schema: responseSchema
+      }
+    },
+    temperature: 0.1,
+    max_tokens: 2_000
+  };
+  const requestMetadata = {
+    prompt_chars: userPrompt.length,
+    system_prompt_chars: INTELLIGENCE_SYSTEM_PROMPT.length,
+    schema_chars: JSON.stringify(responseSchema).length,
+    active_event_count: events.length,
+    active_event_ids: events.map((event) => event.event_id),
+    report_count: batchReports.length,
+    pass
+  };
   const attempts = [];
 
   for (let logicalAttempt = 1; logicalAttempt <= 2; logicalAttempt += 1) {
@@ -473,32 +849,17 @@ async function callNebula(batchReports, events, pass, options = {}) {
       ({ response, body } = await fetchNebulaResponse(`${BASE_URL}/chat/completions`, {
         method: "POST",
         headers: { accept: "application/json", "content-type": "application/json", authorization: `Bearer ${API_KEY}` },
-        body: JSON.stringify({
-          model: "radar-fast",
-          messages: [
-            { role: "system", content: INTELLIGENCE_SYSTEM_PROMPT },
-            { role: "user", content: userPrompt }
-          ],
-          response_format: {
-            type: "json_schema",
-            json_schema: {
-              name: "radar_intelligence_batch",
-              strict: true,
-              schema: responseSchema
-            }
-          },
-          temperature: 0.1,
-          max_tokens: 2_000
-        }),
+        body: JSON.stringify(requestPayload),
       }));
     } catch (cause) {
-      const telemetry = { ...buildNebulaTelemetry(null, null, startedAt, "radar-fast"), logical_attempt: logicalAttempt, logical_retry: logicalAttempt > 1 };
+      const telemetry = { ...buildNebulaTelemetry(null, null, startedAt, "radar-fast"), ...requestMetadata, logical_attempt: logicalAttempt, logical_retry: logicalAttempt > 1 };
       const error = new Error(cause?.name === "TimeoutError" ? `nebula_timeout_${REQUEST_TIMEOUT_MS}` : `nebula_request_failed:${cause instanceof Error ? cause.message : String(cause)}`);
       error.backtestCode = cause?.name === "TimeoutError" ? "timeout" : "transport_failure";
       telemetry.logical_error = error.backtestCode;
       error.telemetry = telemetry;
       attempts.push({ telemetry, structured_json: false, prompt_tokens: 0, output_tokens: 0 });
       error.attempts = attempts;
+      error.request_payload = requestPayload;
       if (logicalAttempt === 1 && error.backtestCode === "transport_failure") {
         await waitForBacktestRetry();
         continue;
@@ -506,9 +867,11 @@ async function callNebula(batchReports, events, pass, options = {}) {
       throw error;
     }
 
-    const telemetry = { ...buildNebulaTelemetry(response, body, startedAt, "radar-fast"), logical_attempt: logicalAttempt, logical_retry: logicalAttempt > 1 };
+    const telemetry = { ...buildNebulaTelemetry(response, body, startedAt, "radar-fast"), ...requestMetadata, logical_attempt: logicalAttempt, logical_retry: logicalAttempt > 1 };
     const promptTokens = Number(body?.usage?.prompt_tokens || 0);
     const outputTokens = Number(body?.usage?.completion_tokens || body?.usage?.output_tokens || 0);
+    telemetry.prompt_tokens = promptTokens;
+    telemetry.output_tokens = outputTokens;
     const attempt = { telemetry, structured_json: false, prompt_tokens: promptTokens, output_tokens: outputTokens };
     attempts.push(attempt);
     if (!response.ok) {
@@ -516,6 +879,7 @@ async function callNebula(batchReports, events, pass, options = {}) {
       error.backtestCode = `http_${response.status}`;
       error.telemetry = telemetry;
       error.attempts = attempts;
+      error.request_payload = requestPayload;
       if (logicalAttempt === 1 && isTransientBacktestStatus(response.status)) {
         await waitForBacktestRetry();
         continue;
@@ -528,6 +892,7 @@ async function callNebula(batchReports, events, pass, options = {}) {
       error.backtestCode = "malformed_json";
       error.telemetry = { ...telemetry, structured_json: false };
       error.attempts = attempts;
+      error.request_payload = requestPayload;
       throw error;
     }
     attempt.structured_json = true;
@@ -540,6 +905,8 @@ async function callNebula(batchReports, events, pass, options = {}) {
       output_tokens_estimated: outputTokens <= 0,
       telemetry: { ...telemetry, structured_json: true },
       attempts,
+      request_payload: requestPayload,
+      request_metadata: requestMetadata,
       report_count: batchReports.length,
       end_to_end_latency_ms: Date.now() - startedAt
     };
@@ -566,6 +933,63 @@ async function fetchNebulaResponse(url, init) {
     return await Promise.race([request, timeout]);
   } finally {
     clearTimeout(timeoutId);
+  }
+}
+
+async function replayGatewayFailures(artifacts) {
+  const gatewayArtifacts = artifacts.filter((artifact) => {
+    const last = artifact.attempts.at(-1);
+    return last && (last.status === 502 || last.status === 503 || last.status === 504 || last.status === null);
+  });
+  const replayResults = [];
+  for (const artifact of gatewayArtifacts) {
+    const attempts = [];
+    let recovered = false;
+    for (let queueAttempt = 1; queueAttempt <= 3; queueAttempt += 1) {
+      const startedAt = Date.now();
+      let response = null;
+      let body = null;
+      let failure = null;
+      try {
+        ({ response, body } = await fetchNebulaResponse(`${BASE_URL}/chat/completions`, {
+          method: "POST",
+          headers: { accept: "application/json", "content-type": "application/json", authorization: `Bearer ${API_KEY}` },
+          body: JSON.stringify(artifact.request_payload)
+        }));
+        const telemetry = { ...buildNebulaTelemetry(response, body, startedAt, "radar-fast"), queue_attempt: queueAttempt };
+        const output = parseOutput(body);
+        const structured = Boolean(response.ok && output);
+        const valid = structured && validateQueueReplayOutput(output, artifact);
+        attempts.push({ queue_attempt: queueAttempt, ...telemetry, structured_json: structured, valid, prompt_tokens: Number(body?.usage?.prompt_tokens || 0), output_tokens: Number(body?.usage?.completion_tokens || body?.usage?.output_tokens || 0) });
+        if (response.ok && valid) {
+          recovered = true;
+          break;
+        }
+      } catch (error) {
+        failure = error instanceof Error ? error.message : String(error);
+        attempts.push({ queue_attempt: queueAttempt, status: null, request_id: null, fallback_attempts: 0, latency_ms: Date.now() - startedAt, structured_json: false, valid: false, failure });
+      }
+    }
+    replayResults.push({
+      report_ids: artifact.report_ids,
+      window_end: artifact.window_end,
+      initial_request_ids: artifact.request_ids,
+      attempts,
+      recovered,
+      final_request_id: attempts.at(-1)?.request_id ?? null
+    });
+  }
+  fs.mkdirSync(DIAGNOSTIC_ROOT, { recursive: true });
+  fs.writeFileSync(path.join(DIAGNOSTIC_ROOT, "queue-equivalent-replay.json"), `${JSON.stringify(replayResults, null, 2)}\n`, "utf8");
+  return replayResults;
+}
+
+function validateQueueReplayOutput(output, artifact) {
+  try {
+    validateDecisions(output, artifact.report_ids.map((id) => ({ id })), new Set(artifact.active_event_ids), new Set(artifact.report_ids));
+    return true;
+  } catch {
+    return false;
   }
 }
 
@@ -669,7 +1093,20 @@ function recordNebulaTelemetry(metrics, telemetry) {
     request_id: telemetry.request_id,
     status: telemetry.status,
     latency_ms: telemetry.latency_ms,
-    fallback_attempts: telemetry.fallback_attempts
+    fallback_attempts: telemetry.fallback_attempts,
+    logical_attempt: telemetry.logical_attempt,
+    logical_retry: telemetry.logical_retry,
+    prompt_chars: telemetry.prompt_chars,
+    system_prompt_chars: telemetry.system_prompt_chars,
+    schema_chars: telemetry.schema_chars,
+    active_event_count: telemetry.active_event_count,
+    active_event_ids: telemetry.active_event_ids,
+    report_count: telemetry.report_count,
+    pass: telemetry.pass,
+    logical_kind: telemetry.logical_kind,
+    final_attempt: telemetry.final_attempt,
+    prompt_tokens: telemetry.prompt_tokens ?? null,
+    output_tokens: telemetry.output_tokens ?? null
   });
   const success = telemetry.status != null && telemetry.status >= 200 && telemetry.status < 300;
   if (success) metrics.nebula_successful += 1;
@@ -689,10 +1126,36 @@ function recordNebulaTelemetry(metrics, telemetry) {
   if (telemetry.routed_model) metrics.routed_model_distribution.set(telemetry.routed_model, (metrics.routed_model_distribution.get(telemetry.routed_model) || 0) + 1);
 }
 
+function summarizeProviderBehavior(telemetryRecords) {
+  const groups = new Map();
+  for (const telemetry of telemetryRecords.filter((item) => item.status >= 200 && item.status < 300)) {
+    const provider = telemetry.provider || "unknown";
+    const values = groups.get(provider) || [];
+    values.push(telemetry);
+    groups.set(provider, values);
+  }
+  return [...groups.entries()].map(([provider, values]) => ({
+    provider,
+    requests: values.length,
+    median_reports: median(values.map((value) => value.report_count).filter(Number.isFinite)),
+    median_events: median(values.map((value) => value.active_event_count).filter(Number.isFinite)),
+    median_prompt_chars: median(values.map((value) => value.prompt_chars).filter(Number.isFinite)),
+    median_schema_chars: median(values.map((value) => value.schema_chars).filter(Number.isFinite)),
+    median_input_tokens: median(values.map((value) => value.prompt_tokens).filter(Number.isFinite)),
+    median_latency_ms: median(values.map((value) => value.latency_ms).filter(Number.isFinite)),
+    fallback_attempts: values.reduce((sum, value) => sum + (value.fallback_attempts || 0), 0),
+    routed_models: [...new Set(values.map((value) => value.routed_model).filter(Boolean))]
+  }));
+}
+
 function recordCallResult(metrics, result, error, kind) {
   const attempts = result?.attempts || error?.attempts || [];
   metrics.logical_requests_total += 1;
-  for (const attempt of attempts) recordNebulaTelemetry(metrics, attempt.telemetry);
+  attempts.forEach((attempt, index) => {
+    attempt.telemetry.logical_kind = kind;
+    attempt.telemetry.final_attempt = index === attempts.length - 1;
+    recordNebulaTelemetry(metrics, attempt.telemetry);
+  });
 
   const first = attempts[0];
   const initialSucceeded = Boolean(first?.structured_json && first.telemetry?.status >= 200 && first.telemetry?.status < 300);
@@ -713,6 +1176,30 @@ function recordCallResult(metrics, result, error, kind) {
     if (retrySucceeded) metrics.transient_retry_successes += 1;
     else metrics.transient_retry_failures += 1;
   }
+}
+
+function recordInitialGatewayForensics(metrics, batch, events, result, error) {
+  const attempts = result?.attempts || error?.attempts || [];
+  const first = attempts[0];
+  if (!first || first.telemetry?.status !== 502) return;
+  const last = attempts.at(-1);
+  metrics.initial_gateway_forensics.push({
+    window_end: batch.window_end,
+    report_ids: batch.reports.map((report) => report.id),
+    report_count: batch.reports.length,
+    active_event_count: events.length,
+    active_event_ids: events.map((event) => event.event_id),
+    prompt_chars: first.telemetry.prompt_chars,
+    system_prompt_chars: first.telemetry.system_prompt_chars,
+    schema_chars: first.telemetry.schema_chars,
+    input_tokens: first.prompt_tokens || first.telemetry.prompt_tokens || 0,
+    first_request_id: first.telemetry.request_id,
+    retry_request_id: attempts[1]?.telemetry?.request_id ?? null,
+    first_fallbacks: first.telemetry.fallback_attempts,
+    retry_fallbacks: attempts[1]?.telemetry?.fallback_attempts ?? null,
+    retry_status: last?.telemetry?.status ?? null,
+    retry_result: last?.structured_json && last.telemetry?.status >= 200 && last.telemetry?.status < 300 ? "success" : "failed"
+  });
 }
 
 function addTokenMetricsFromCall(metrics, result, kind = "primary") {
@@ -991,88 +1478,73 @@ function buildProductionProjection(rows, events, metrics, observedTotalCalls) {
   const reportsPerHour = 341;
   const windowsPerHour = 12;
   const reportsPerWindow = reportsPerHour / windowsPerHour;
-  const reportPayloadSizes = rows.map((report) => JSON.stringify(compactReport(report)).length);
-  const averageReportPayloadChars = average(reportPayloadSizes) || 0;
-  const activeEventPromptChars = buildUserPrompt([], events, "primary").length;
-  const fixedPromptChars = INTELLIGENCE_SYSTEM_PROMPT.length + activeEventPromptChars;
-  const availableReportChars = Math.max(0, MAX_PAYLOAD_CHARS - fixedPromptChars);
-  const payloadReportCapacity = averageReportPayloadChars > 0
-    ? Math.max(1, Math.floor(availableReportChars / averageReportPayloadChars))
-    : MAX_REPORTS_PER_BATCH;
-  const effectiveReportsPerBatch = Math.max(1, Math.min(MAX_REPORTS_PER_BATCH, payloadReportCapacity, reportsPerWindow));
+  const projectionCap = Math.max(1, Math.min(40, Number(process.env.RADAR_PROJECTION_CAP || 20)));
+  const highDensityEvidence = loadHighDensityEvidence(projectionCap);
+  const secondPassRate = metrics.primary_calls === 0 ? 0 : metrics.second_pass_calls / metrics.primary_calls;
+  const correctionRate = metrics.primary_calls === 0 ? 0 : metrics.contract_correction_calls / metrics.primary_calls;
+  const effectiveReportsPerBatch = Math.min(MAX_REPORTS_PER_BATCH, reportsPerWindow);
   const batchesPerWindow = Math.max(1, Math.ceil(reportsPerWindow / effectiveReportsPerBatch));
   const primaryCallsPerHour = windowsPerHour * batchesPerWindow;
-  const secondPassRate = metrics.primary_calls === 0 ? 0 : metrics.second_pass_calls / metrics.primary_calls;
   const secondPassCallsPerHour = primaryCallsPerHour * secondPassRate;
-  const correctionRate = metrics.primary_calls === 0 ? 0 : metrics.contract_correction_calls / metrics.primary_calls;
   const correctionCallsPerHour = primaryCallsPerHour * correctionRate;
   const logicalCallsPerHour = primaryCallsPerHour + secondPassCallsPerHour + correctionCallsPerHour;
-  const retryRate = metrics.logical_requests_total === 0 ? 0 : metrics.transient_retry_calls / metrics.logical_requests_total;
-  const transientRetriesPerHour = logicalCallsPerHour * retryRate;
-  const observedPhysicalCalls = metrics.request_telemetry.length;
-  const averageFallbackAttemptsPerPhysicalCall = observedPhysicalCalls === 0 ? 0 : metrics.fallback_attempts / observedPhysicalCalls;
-  const providerFallbackAttemptsPerHour = logicalCallsPerHour * averageFallbackAttemptsPerPhysicalCall;
-  const physicalNebulaCallsPerHour = logicalCallsPerHour + transientRetriesPerHour;
-  const averageReportsPerKind = (kind) => {
-    const samples = metrics.token_samples.filter((sample) => sample.kind === kind && sample.reports > 0);
-    return samples.length === 0 ? effectiveReportsPerBatch : samples.reduce((sum, sample) => sum + sample.reports, 0) / samples.length;
-  };
-  const averageInputTokensPerReport = (kind) => {
-    const samples = metrics.token_samples.filter((sample) => sample.kind === kind && sample.reports > 0);
-    return samples.length === 0 ? 0 : samples.reduce((sum, sample) => sum + sample.input_tokens / sample.reports, 0) / samples.length;
-  };
-  const averageOutputTokensPerCall = (kind) => {
-    const samples = metrics.token_samples.filter((sample) => sample.kind === kind);
-    return samples.length === 0 ? 0 : samples.reduce((sum, sample) => sum + sample.output_tokens, 0) / samples.length;
-  };
-  const primaryInputTokensPerCall = effectiveReportsPerBatch * averageInputTokensPerReport("primary");
-  const secondInputTokensPerCall = averageInputTokensPerReport("ambiguity") * averageReportsPerKind("ambiguity");
-  const correctionInputTokensPerCall = averageInputTokensPerReport("correction") * averageReportsPerKind("correction");
-  const primaryOutputTokensPerCall = averageOutputTokensPerCall("primary");
-  const secondOutputTokensPerCall = averageOutputTokensPerCall("ambiguity");
-  const correctionOutputTokensPerCall = averageOutputTokensPerCall("correction");
-  const inputTokensPerLogicalHour = primaryCallsPerHour * primaryInputTokensPerCall
-    + secondPassCallsPerHour * secondInputTokensPerCall
-    + correctionCallsPerHour * correctionInputTokensPerCall;
-  const outputTokensPerLogicalHour = primaryCallsPerHour * primaryOutputTokensPerCall
-    + secondPassCallsPerHour * secondOutputTokensPerCall
-    + correctionCallsPerHour * correctionOutputTokensPerCall;
-  const successfulLogicalCalls = Math.max(1, metrics.token_samples.length);
-  const averageInputTokensPerPhysicalCall = metrics.prompt_tokens / successfulLogicalCalls;
-  const averageOutputTokensPerPhysicalCall = metrics.output_tokens / successfulLogicalCalls;
-  const inputTokensPerHour = inputTokensPerLogicalHour + transientRetriesPerHour * averageInputTokensPerPhysicalCall;
-  const outputTokensPerHour = outputTokensPerLogicalHour + transientRetriesPerHour * averageOutputTokensPerPhysicalCall;
-
+  if (!highDensityEvidence) {
+    return {
+      reports_per_hour: reportsPerHour,
+      windows_per_hour: windowsPerHour,
+      reports_per_window: Number(reportsPerWindow.toFixed(3)),
+      max_reports_per_batch: MAX_REPORTS_PER_BATCH,
+      effective_reports_per_batch: Number(effectiveReportsPerBatch.toFixed(3)),
+      batches_per_window: batchesPerWindow,
+      primary_calls_per_hour: Number(primaryCallsPerHour.toFixed(3)),
+      second_pass_calls_per_hour: Number(secondPassCallsPerHour.toFixed(3)),
+      contract_corrections_per_hour: Number(correctionCallsPerHour.toFixed(3)),
+      input_tokens_per_hour: null,
+      output_tokens_per_hour: null,
+      token_projection_status: `pending_high_density_cap_${projectionCap}`,
+      token_projection_basis: "not extrapolated from low-density historical batches"
+    };
+  }
+  const successfulHttpAttempts = Math.max(1, highDensityEvidence.http_successes || highDensityEvidence.successful || 1);
+  const physicalAttemptsPerLogicalRequest = Math.max(1, highDensityEvidence.requests_detail.reduce((sum, request) => sum + (request.attempts?.length || 0), 0) / Math.max(1, highDensityEvidence.requests));
+  const inputTokensPerPhysicalRequest = highDensityEvidence.total_input_tokens / successfulHttpAttempts;
+  const outputTokensPerPhysicalRequest = highDensityEvidence.total_output_tokens / successfulHttpAttempts;
+  const physicalNebulaCallsPerHour = logicalCallsPerHour * physicalAttemptsPerLogicalRequest;
+  const inputTokensPerHour = physicalNebulaCallsPerHour * inputTokensPerPhysicalRequest;
+  const outputTokensPerHour = physicalNebulaCallsPerHour * outputTokensPerPhysicalRequest;
   return {
     reports_per_hour: reportsPerHour,
     windows_per_hour: windowsPerHour,
     reports_per_window: Number(reportsPerWindow.toFixed(3)),
     max_reports_per_batch: MAX_REPORTS_PER_BATCH,
-    average_report_payload_chars: averageReportPayloadChars,
-    active_event_prompt_chars: activeEventPromptChars,
-    fixed_prompt_chars: fixedPromptChars,
-    payload_report_capacity: payloadReportCapacity,
     effective_reports_per_batch: Number(effectiveReportsPerBatch.toFixed(3)),
     batches_per_window: batchesPerWindow,
+    candidate_event_cap: projectionCap,
+    target_high_density_requests: highDensityEvidence.requests,
+    target_high_density_successes: highDensityEvidence.successful,
+    average_target_input_tokens_per_success: Number(inputTokensPerPhysicalRequest.toFixed(2)),
+    average_target_output_tokens_per_success: Number(outputTokensPerPhysicalRequest.toFixed(2)),
+    physical_attempts_per_logical_request: Number(physicalAttemptsPerLogicalRequest.toFixed(3)),
     primary_calls_per_hour: Number(primaryCallsPerHour.toFixed(3)),
     second_pass_calls_per_hour: Number(secondPassCallsPerHour.toFixed(3)),
     contract_corrections_per_hour: Number(correctionCallsPerHour.toFixed(3)),
-    transient_retries_per_hour: Number(transientRetriesPerHour.toFixed(3)),
-    provider_fallback_attempts_per_hour: Number(providerFallbackAttemptsPerHour.toFixed(3)),
-    logical_radar_requests_per_hour: Number(logicalCallsPerHour.toFixed(3)),
     physical_nebula_calls_per_hour: Number(physicalNebulaCallsPerHour.toFixed(3)),
-    total_nebula_calls_per_hour: Number(physicalNebulaCallsPerHour.toFixed(3)),
     input_tokens_per_hour: Number(inputTokensPerHour.toFixed(3)),
     output_tokens_per_hour: Number(outputTokensPerHour.toFixed(3)),
-    primary_calls_per_day: Number((primaryCallsPerHour * 24).toFixed(3)),
     total_calls_per_day: Number((physicalNebulaCallsPerHour * 24).toFixed(3)),
     input_tokens_per_day: Number((inputTokensPerHour * 24).toFixed(3)),
     output_tokens_per_day: Number((outputTokensPerHour * 24).toFixed(3)),
     request_reduction_vs_341_individual_calls: Number((1 - physicalNebulaCallsPerHour / reportsPerHour).toFixed(4)),
-    radar_logical_request_reduction_vs_341: Number((1 - logicalCallsPerHour / reportsPerHour).toFixed(4)),
-    token_projection_basis: "successful backtest token telemetry by request kind, scaled to 12 five-minute windows and observed retry rates",
-    workload: physicalNebulaCallsPerHour <= 100 && metrics.transient_retry_failures === 0 ? "SUSTAINABLE" : "BORDERLINE"
+    token_projection_status: "measured_high_density_payload",
+    token_projection_basis: "10 real historical 28-report payloads at the selected candidate cap"
   };
+}
+
+function loadHighDensityEvidence(cap) {
+  const file = path.join(DIAGNOSTIC_ROOT, `high-density-cap-${cap}.json`);
+  if (!fs.existsSync(file)) return null;
+  const evidence = JSON.parse(fs.readFileSync(file, "utf8"));
+  return evidence && Array.isArray(evidence.requests_detail) ? evidence : null;
 }
 
 function parseOutput(body) {
