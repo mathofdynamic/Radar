@@ -34,6 +34,26 @@ const SAMPLE_FILTER = SAMPLE === "baseline-v8-500"
       AND COALESCE(rp.published_at, rp.observed_at) <= '${BASELINE_SAMPLE_END}'`
   : "";
 
+function scopeIntelligenceBatchJsonSchema(allowedPostIds, allowedEventIds, duplicateTargetPostIds = allowedPostIds) {
+  const schema = JSON.parse(JSON.stringify(intelligenceBatchJsonSchema));
+  const decision = schema.properties.decisions.items;
+  const postIds = uniquePositiveIds(allowedPostIds);
+  const eventIds = uniquePositiveIds(allowedEventIds);
+  const duplicateTargetIds = uniquePositiveIds(duplicateTargetPostIds);
+  decision.properties.post_ids.items = { type: "integer", enum: postIds };
+  decision.properties.event_id = eventIds.length > 0
+    ? { anyOf: [{ type: "integer", enum: eventIds }, { type: "null" }] }
+    : { type: "null" };
+  decision.properties.duplicate_of_post_id = duplicateTargetIds.length > 0
+    ? { anyOf: [{ type: "integer", enum: duplicateTargetIds }, { type: "null" }] }
+    : { type: "null" };
+  return schema;
+}
+
+function uniquePositiveIds(values) {
+  return [...new Set(values)].filter((value) => Number.isSafeInteger(value) && value > 0).sort((left, right) => left - right);
+}
+
 if (!API_KEY) {
   console.error("BACKTEST_BLOCKED: NEBULA_API_KEY is not available in the process environment.");
   console.error("Production-derived D1 data is available, but the Worker secret cannot be read from D1 or inferred safely.");
@@ -105,6 +125,23 @@ const metrics = {
   batches: batches.length,
   primary_calls: 0,
   second_pass_calls: 0,
+  correction_calls: 0,
+  logical_requests_total: 0,
+  initial_logical_requests: 0,
+  initial_successes: 0,
+  initial_failures: 0,
+  initial_http_502: 0,
+  initial_transport_failures: 0,
+  initial_timeouts: 0,
+  transient_retry_calls: 0,
+  transient_retry_successes: 0,
+  transient_retry_failures: 0,
+  contract_correction_calls: 0,
+  contract_correction_successes: 0,
+  contract_correction_failures: 0,
+  final_logical_batches: batches.length,
+  final_logical_batches_successful: 0,
+  final_logical_batches_failed: 0,
   nebula_successful: 0,
   nebula_failed: 0,
   fallback_recoveries: 0,
@@ -119,6 +156,7 @@ const metrics = {
   unknown_event_ids: 0,
   contradictory_assignments: 0,
   missing_assignments: 0,
+  duplicate_target_violations: 0,
   rejected_unsafe_responses: 0,
   prompt_tokens: 0,
   output_tokens: 0,
@@ -137,6 +175,8 @@ const metrics = {
   second_pass_failures: 0,
   copied_source_cases: 0,
   request_telemetry: [],
+  initial_latency_samples: [],
+  end_to_end_latency_samples: [],
   provider_distribution: new Map(),
   routed_model_distribution: new Map(),
   manual_review: {
@@ -158,16 +198,31 @@ for (let batchStart = 0; batchStart < batches.length; batchStart += MAX_CONCURRE
 }
 
 async function processBatch(batch, batchIndex) {
+  const batchStartedAt = Date.now();
+  const correctionState = { used: false };
   let decisions;
+  let primaryCallCompleted = false;
   try {
     metrics.primary_calls += 1;
     const primary = await callNebula(batch.reports, activeEvents, "primary");
-    recordNebulaTelemetry(metrics, primary.telemetry);
-    addTokenMetrics(metrics, primary, batch.reports.length);
-    decisions = validateDecisions(primary.output, batch.reports, knownEventIds, new Set(batch.reports.map((report) => report.id)));
+    recordCallResult(metrics, primary, null, "primary");
+    addTokenMetricsFromCall(metrics, primary, "primary");
+    primaryCallCompleted = true;
+    const primaryValidation = await validateWithCorrection(
+      batch.reports,
+      activeEvents,
+      primary.output,
+      batch.reports.map((report) => report.id),
+      knownEventIds,
+      new Set(batch.reports.map((report) => report.id)),
+      correctionState,
+      metrics
+    );
+    decisions = primaryValidation.decisions;
   } catch (error) {
+    if (!primaryCallCompleted) recordCallResult(metrics, null, error, "primary");
     metrics.failed_batches += 1;
-    recordNebulaTelemetry(metrics, error?.telemetry);
+    metrics.final_logical_batches_failed += 1;
     recordRejectedResponse(metrics, error);
     console.warn(`BACKTEST_BATCH_FAILED window=${batch.window_end} reports=${batch.reports.length} error=${error instanceof Error ? error.message : String(error)}`);
     return;
@@ -178,24 +233,64 @@ async function processBatch(batch, batchIndex) {
   if (uncertainIds.length > 0) {
     const focusedReports = batch.reports.filter((report) => uncertainIds.includes(report.id));
     const focusedEvents = activeEvents.filter((event) => decisions.some((decision) => decision.event_id === event.event_id && decision.post_ids.some((id) => uncertainIds.includes(id)))).slice(0, 5);
+    let secondCallCompleted = false;
     try {
       metrics.second_pass_calls += 1;
-      const second = await callNebula(focusedReports, focusedEvents, "ambiguity");
-      recordNebulaTelemetry(metrics, second.telemetry);
-      addTokenMetrics(metrics, second, focusedReports.length);
-      const resolved = validateDecisions(second.output, focusedReports, knownEventIds, new Set(batch.reports.map((report) => report.id)));
+      const second = await callNebula(focusedReports, focusedEvents, "ambiguity", {
+        expectedPostIds: uncertainIds,
+        duplicateTargetPostIds: batch.reports.map((report) => report.id)
+      });
+      recordCallResult(metrics, second, null, "ambiguity");
+      addTokenMetricsFromCall(metrics, second, "ambiguity");
+      secondCallCompleted = true;
+      const secondValidation = await validateWithCorrection(
+        focusedReports,
+        focusedEvents,
+        second.output,
+        uncertainIds,
+        new Set(focusedEvents.map((event) => event.event_id)),
+        new Set(batch.reports.map((report) => report.id)),
+        correctionState,
+        metrics
+      );
+      const resolved = secondValidation.decisions;
       const resolvedIds = new Set(uncertainIds);
       decisions = [...decisions.filter((decision) => !decision.post_ids.some((id) => resolvedIds.has(id))), ...resolved];
       const finalUncertainIds = new Set(decisions.filter((decision) => decision.action === "UNCERTAIN" || decision.confidence < AMBIGUITY_THRESHOLD).flatMap((decision) => decision.post_ids));
       metrics.resolved_second_pass += [...resolvedIds].filter((id) => !finalUncertainIds.has(id)).length;
     } catch (error) {
       metrics.second_pass_failures += 1;
-      recordNebulaTelemetry(metrics, error?.telemetry);
+      if (!secondCallCompleted) recordCallResult(metrics, null, error, "ambiguity");
+      metrics.failed_batches += 1;
+      metrics.final_logical_batches_failed += 1;
       recordRejectedResponse(metrics, error);
       console.warn(`AMBIGUITY_OUTPUT_REJECTED: ${error instanceof Error ? error.message : String(error)}`);
+      return;
     }
   }
 
+  try {
+    const finalValidation = await validateWithCorrection(
+      batch.reports,
+      activeEvents,
+      { decisions },
+      batch.reports.map((report) => report.id),
+      knownEventIds,
+      new Set(batch.reports.map((report) => report.id)),
+      correctionState,
+      metrics
+    );
+    decisions = finalValidation.decisions;
+  } catch (error) {
+    metrics.failed_batches += 1;
+    metrics.final_logical_batches_failed += 1;
+    recordRejectedResponse(metrics, error);
+    console.warn(`FINAL_OUTPUT_REJECTED: ${error instanceof Error ? error.message : String(error)}`);
+    return;
+  }
+
+  metrics.final_logical_batches_successful += 1;
+  metrics.end_to_end_latency_samples.push(Date.now() - batchStartedAt);
   const finalUncertainIds = [...new Set(decisions.filter((decision) => decision.action === "UNCERTAIN" || decision.confidence < AMBIGUITY_THRESHOLD).flatMap((decision) => decision.post_ids))];
   metrics.still_uncertain += finalUncertainIds.length;
   for (const postId of finalUncertainIds) {
@@ -210,15 +305,47 @@ async function processBatch(batch, batchIndex) {
   }
 }
 
+async function validateWithCorrection(batchReports, events, output, expectedPostIds, knownEventIds, allowedPostIds, correctionState, metrics) {
+  try {
+    return { decisions: validateDecisions(output, batchReports, knownEventIds, allowedPostIds) };
+  } catch (error) {
+    if (!isCorrectableBacktestError(error) || correctionState.used) throw error;
+    correctionState.used = true;
+    metrics.correction_calls += 1;
+    metrics.contract_correction_calls += 1;
+    let correctionCallCompleted = false;
+    try {
+      const correction = await callNebula(batchReports, events, "correction", {
+        expectedPostIds,
+        duplicateTargetPostIds: [...allowedPostIds],
+        priorDecisions: output?.decisions || [],
+        correctionError: error.message
+      });
+      recordCallResult(metrics, correction, null, "correction");
+      addTokenMetricsFromCall(metrics, correction, "correction");
+      correctionCallCompleted = true;
+      const decisions = validateDecisions(correction.output, batchReports, knownEventIds, allowedPostIds);
+      metrics.contract_correction_successes += 1;
+      return { decisions };
+    } catch (correctionError) {
+      if (!correctionCallCompleted) recordCallResult(metrics, null, correctionError, "correction");
+      metrics.contract_correction_failures += 1;
+      throw correctionError;
+    }
+  }
+}
+
 const batchSizes = batches.map((batch) => batch.reports.length).sort((left, right) => left - right);
 const sampleDates = reports.map((report) => new Date(report.published_at || report.observed_at)).filter((date) => !Number.isNaN(date.getTime()));
 const sampleStart = sampleDates.length > 0 ? new Date(Math.min(...sampleDates.map((date) => date.getTime()))) : null;
 const sampleEnd = sampleDates.length > 0 ? new Date(Math.max(...sampleDates.map((date) => date.getTime()))) : null;
 const sampleDurationHours = sampleStart && sampleEnd ? Math.max((sampleEnd.getTime() - sampleStart.getTime()) / 3_600_000, 5 / 60) : null;
-const totalCalls = metrics.primary_calls + metrics.second_pass_calls;
+const totalCalls = metrics.logical_requests_total;
 const totalPairComparisons = metrics.existing_event_agreements + metrics.disagreements;
 const providerDistribution = [...metrics.provider_distribution.entries()].map(([provider, values]) => ({ provider, ...values }));
 const latencies = metrics.request_telemetry.map((request) => request.latency_ms).filter((value) => Number.isFinite(value));
+const initialLatencies = metrics.initial_latency_samples.filter((value) => Number.isFinite(value));
+const endToEndLatencies = metrics.end_to_end_latency_samples.filter((value) => Number.isFinite(value));
 const productionProjection = buildProductionProjection(reports, activeEvents, metrics, totalCalls);
 console.log(JSON.stringify({
   sample_selection: SAMPLE,
@@ -229,6 +356,25 @@ console.log(JSON.stringify({
   sample_date_range: { start: sampleStart?.toISOString() ?? null, end: sampleEnd?.toISOString() ?? null, duration_hours: sampleDurationHours },
   primary_calls: metrics.primary_calls,
   second_pass_calls: metrics.second_pass_calls,
+  correction_calls: metrics.correction_calls,
+  logical_requests_total: metrics.logical_requests_total,
+  initial_logical_requests: metrics.initial_logical_requests,
+  initial_successes: metrics.initial_successes,
+  initial_failures: metrics.initial_failures,
+  raw_initial_success_rate: metrics.initial_logical_requests === 0 ? null : Number((metrics.initial_successes / metrics.initial_logical_requests).toFixed(4)),
+  initial_http_502: metrics.initial_http_502,
+  initial_transport_failures: metrics.initial_transport_failures,
+  initial_timeouts: metrics.initial_timeouts,
+  transient_retry_calls: metrics.transient_retry_calls,
+  transient_retry_successes: metrics.transient_retry_successes,
+  transient_retry_failures: metrics.transient_retry_failures,
+  contract_correction_calls: metrics.contract_correction_calls,
+  contract_correction_successes: metrics.contract_correction_successes,
+  contract_correction_failures: metrics.contract_correction_failures,
+  final_logical_batches: metrics.final_logical_batches,
+  final_logical_batches_successful: metrics.final_logical_batches_successful,
+  final_logical_batches_failed: metrics.final_logical_batches_failed,
+  final_logical_success_rate: metrics.final_logical_batches === 0 ? null : Number((metrics.final_logical_batches_successful / metrics.final_logical_batches).toFixed(4)),
   successful: metrics.nebula_successful,
   failed: metrics.nebula_failed,
   fallback_recoveries: metrics.fallback_recoveries,
@@ -238,7 +384,7 @@ console.log(JSON.stringify({
   http_5xx: metrics.http_5xx,
   timeouts: metrics.timeouts,
   request_telemetry_records: metrics.request_telemetry.length,
-  latency_ms: { average: average(latencies), median: median(latencies), p95: percentile(latencies, 0.95), maximum: latencies.length === 0 ? null : Math.max(...latencies) },
+  latency_ms: { average: average(latencies), median: median(latencies), p95: percentile(latencies, 0.95), maximum: latencies.length === 0 ? null : Math.max(...latencies), initial_median: median(initialLatencies), initial_p95: percentile(initialLatencies, 0.95), initial_maximum: initialLatencies.length === 0 ? null : Math.max(...initialLatencies), end_to_end_median: median(endToEndLatencies), end_to_end_p95: percentile(endToEndLatencies, 0.95), end_to_end_maximum: endToEndLatencies.length === 0 ? null : Math.max(...endToEndLatencies) },
   provider_distribution: providerDistribution,
   routed_model_distribution: [...metrics.routed_model_distribution.entries()].map(([model, calls]) => ({ model, calls })),
   average_reports_per_request: batches.length === 0 ? null : Number((reports.length / batches.length).toFixed(4)),
@@ -246,8 +392,8 @@ console.log(JSON.stringify({
   maximum_reports_per_request: batchSizes.length === 0 ? null : batchSizes[batchSizes.length - 1],
   total_input_tokens: metrics.prompt_tokens,
   total_output_tokens: metrics.output_tokens,
-  average_input_tokens: totalCalls === 0 ? null : Number((metrics.prompt_tokens / totalCalls).toFixed(2)),
-  average_output_tokens: totalCalls === 0 ? null : Number((metrics.output_tokens / totalCalls).toFixed(2)),
+  average_input_tokens: metrics.nebula_successful === 0 ? null : Number((metrics.prompt_tokens / metrics.nebula_successful).toFixed(2)),
+  average_output_tokens: metrics.nebula_successful === 0 ? null : Number((metrics.output_tokens / metrics.nebula_successful).toFixed(2)),
   token_estimates_used: metrics.estimated_prompt_tokens > 0 || metrics.estimated_output_tokens > 0,
   existing_event_agreements: metrics.existing_event_agreements,
   new_event_agreements: metrics.new_event_agreements,
@@ -261,6 +407,7 @@ console.log(JSON.stringify({
   schema_failures: metrics.schema_failures,
   unknown_post_ids: metrics.unknown_post_ids,
   unknown_event_ids: metrics.unknown_event_ids,
+  duplicate_target_violations: metrics.duplicate_target_violations,
   contradictory_assignments: metrics.contradictory_assignments,
   missing_assignments: metrics.missing_assignments,
   rejected_unsafe_responses: metrics.rejected_unsafe_responses,
@@ -310,72 +457,119 @@ function buildBatches(rows) {
   return batches;
 }
 
-async function callNebula(batchReports, events, pass) {
-  const userPrompt = buildUserPrompt(batchReports, events, pass);
+async function callNebula(batchReports, events, pass, options = {}) {
+  const expectedPostIds = options.expectedPostIds || batchReports.map((report) => report.id);
+  const duplicateTargetPostIds = options.duplicateTargetPostIds || batchReports.map((report) => report.id);
+  const userPrompt = buildUserPrompt(batchReports, events, pass, options);
   if (userPrompt.length + INTELLIGENCE_SYSTEM_PROMPT.length > MAX_PAYLOAD_CHARS) throw new Error("backtest_payload_too_large");
+  const responseSchema = scopeIntelligenceBatchJsonSchema(expectedPostIds, events.map((event) => event.event_id), duplicateTargetPostIds);
+  const attempts = [];
 
-  const startedAt = Date.now();
-  let response;
-  let body = null;
-  try {
-    response = await fetch(`${BASE_URL}/chat/completions`, {
-      method: "POST",
-      headers: { accept: "application/json", "content-type": "application/json", authorization: `Bearer ${API_KEY}` },
-      body: JSON.stringify({
-        model: "radar-fast",
-        messages: [
-          { role: "system", content: INTELLIGENCE_SYSTEM_PROMPT },
-          { role: "user", content: userPrompt }
-        ],
-        response_format: {
-          type: "json_schema",
-          json_schema: {
-            name: "radar_intelligence_batch",
-            strict: true,
-            schema: intelligenceBatchJsonSchema
-          }
-        },
-        temperature: 0.1,
-        max_tokens: 2_000
-      }),
-      signal: AbortSignal.timeout(REQUEST_TIMEOUT_MS)
-    });
-  } catch (cause) {
-    const error = new Error(cause?.name === "TimeoutError" ? `nebula_timeout_${REQUEST_TIMEOUT_MS}` : `nebula_request_failed:${cause instanceof Error ? cause.message : String(cause)}`);
-    error.backtestCode = cause?.name === "TimeoutError" ? "timeout" : "request_failed";
-    error.telemetry = buildNebulaTelemetry(null, null, startedAt, "radar-fast");
-    throw error;
+  for (let logicalAttempt = 1; logicalAttempt <= 2; logicalAttempt += 1) {
+    const startedAt = Date.now();
+    let response;
+    let body = null;
+    try {
+      ({ response, body } = await fetchNebulaResponse(`${BASE_URL}/chat/completions`, {
+        method: "POST",
+        headers: { accept: "application/json", "content-type": "application/json", authorization: `Bearer ${API_KEY}` },
+        body: JSON.stringify({
+          model: "radar-fast",
+          messages: [
+            { role: "system", content: INTELLIGENCE_SYSTEM_PROMPT },
+            { role: "user", content: userPrompt }
+          ],
+          response_format: {
+            type: "json_schema",
+            json_schema: {
+              name: "radar_intelligence_batch",
+              strict: true,
+              schema: responseSchema
+            }
+          },
+          temperature: 0.1,
+          max_tokens: 2_000
+        }),
+      }));
+    } catch (cause) {
+      const telemetry = { ...buildNebulaTelemetry(null, null, startedAt, "radar-fast"), logical_attempt: logicalAttempt, logical_retry: logicalAttempt > 1 };
+      const error = new Error(cause?.name === "TimeoutError" ? `nebula_timeout_${REQUEST_TIMEOUT_MS}` : `nebula_request_failed:${cause instanceof Error ? cause.message : String(cause)}`);
+      error.backtestCode = cause?.name === "TimeoutError" ? "timeout" : "transport_failure";
+      telemetry.logical_error = error.backtestCode;
+      error.telemetry = telemetry;
+      attempts.push({ telemetry, structured_json: false, prompt_tokens: 0, output_tokens: 0 });
+      error.attempts = attempts;
+      if (logicalAttempt === 1 && error.backtestCode === "transport_failure") {
+        await waitForBacktestRetry();
+        continue;
+      }
+      throw error;
+    }
+
+    const telemetry = { ...buildNebulaTelemetry(response, body, startedAt, "radar-fast"), logical_attempt: logicalAttempt, logical_retry: logicalAttempt > 1 };
+    const promptTokens = Number(body?.usage?.prompt_tokens || 0);
+    const outputTokens = Number(body?.usage?.completion_tokens || body?.usage?.output_tokens || 0);
+    const attempt = { telemetry, structured_json: false, prompt_tokens: promptTokens, output_tokens: outputTokens };
+    attempts.push(attempt);
+    if (!response.ok) {
+      const error = new Error(`nebula_http_${response.status}`);
+      error.backtestCode = `http_${response.status}`;
+      error.telemetry = telemetry;
+      error.attempts = attempts;
+      if (logicalAttempt === 1 && isTransientBacktestStatus(response.status)) {
+        await waitForBacktestRetry();
+        continue;
+      }
+      throw error;
+    }
+    const output = parseOutput(body);
+    if (!output) {
+      const error = new Error("nebula_backtest_invalid_json");
+      error.backtestCode = "malformed_json";
+      error.telemetry = { ...telemetry, structured_json: false };
+      error.attempts = attempts;
+      throw error;
+    }
+    attempt.structured_json = true;
+    const outputChars = JSON.stringify(output).length;
+    return {
+      output,
+      prompt_tokens: promptTokens > 0 ? promptTokens : Math.ceil(userPrompt.length / 4),
+      output_tokens: outputTokens > 0 ? outputTokens : Math.ceil(outputChars / 4),
+      prompt_tokens_estimated: promptTokens <= 0,
+      output_tokens_estimated: outputTokens <= 0,
+      telemetry: { ...telemetry, structured_json: true },
+      attempts,
+      report_count: batchReports.length,
+      end_to_end_latency_ms: Date.now() - startedAt
+    };
   }
-  body = await response.json().catch(() => null);
-  const telemetry = buildNebulaTelemetry(response, body, startedAt, "radar-fast");
-  if (!response.ok) {
-    const error = new Error(`nebula_http_${response.status}`);
-    error.backtestCode = `http_${response.status}`;
-    error.telemetry = telemetry;
-    throw error;
-  }
-  const output = parseOutput(body);
-  if (!output) {
-    const error = new Error("nebula_backtest_invalid_json");
-    error.backtestCode = "malformed_json";
-    error.telemetry = { ...telemetry, structured_json: false };
-    throw error;
-  }
-  const outputChars = JSON.stringify(output).length;
-  const promptTokens = Number(body?.usage?.prompt_tokens || 0);
-  const outputTokens = Number(body?.usage?.completion_tokens || body?.usage?.output_tokens || 0);
-  return {
-    output,
-    prompt_tokens: promptTokens > 0 ? promptTokens : Math.ceil(userPrompt.length / 4),
-    output_tokens: outputTokens > 0 ? outputTokens : Math.ceil(outputChars / 4),
-    prompt_tokens_estimated: promptTokens <= 0,
-    output_tokens_estimated: outputTokens <= 0,
-    telemetry: { ...telemetry, structured_json: true },
-    report_count: batchReports.length
-  };
+  throw new Error("nebula_logical_retry_exhausted");
 }
 
-function buildUserPrompt(batchReports, events, pass) {
+async function fetchNebulaResponse(url, init) {
+  const controller = new AbortController();
+  const request = fetch(url, { ...init, signal: controller.signal }).then(async (response) => ({
+    response,
+    body: await response.json().catch(() => null)
+  }));
+  let timeoutId;
+  const timeout = new Promise((_, reject) => {
+    timeoutId = setTimeout(() => {
+      controller.abort();
+      const error = new Error(`nebula_timeout_${REQUEST_TIMEOUT_MS}`);
+      error.name = "TimeoutError";
+      reject(error);
+    }, REQUEST_TIMEOUT_MS);
+  });
+  try {
+    return await Promise.race([request, timeout]);
+  } finally {
+    clearTimeout(timeoutId);
+  }
+}
+
+function buildUserPrompt(batchReports, events, pass, options = {}) {
   return JSON.stringify({
     task: "Classify every supplied report exactly once. Group reports that describe the same real-world event.",
     pass,
@@ -397,6 +591,11 @@ function buildUserPrompt(batchReports, events, pass) {
       }
     },
     reports: batchReports.map(compactReport),
+    prior_decisions: options.priorDecisions?.length ? options.priorDecisions : undefined,
+    correction: pass === "correction" ? {
+      validation_error: options.correctionError,
+      instruction: "Correct only the deterministic decision-graph error. Use only supplied report and event IDs. Do not invent facts, IDs, or relationships."
+    } : undefined,
     active_events: events.map((event) => ({
       event_id: event.event_id,
       core_fact: event.core_fact,
@@ -430,9 +629,9 @@ function validateDecisions(output, batchReports, knownEventIds, allowedPostIds) 
       assigned.add(Number(postId));
     }
     const duplicateTarget = decision.duplicate_of_post_id ?? null;
-    if (decision.action === "DUPLICATE" && (!Number.isInteger(duplicateTarget) || !allowedPostIds.has(duplicateTarget) || decision.post_ids.includes(duplicateTarget))) throw validationError("schema_failure", "duplicate_target_invalid");
-    if (decision.action !== "DUPLICATE" && duplicateTarget !== null) throw validationError("schema_failure", "duplicate_target_action_invalid");
-    if ((decision.action === "MATCH_EXISTING_EVENT" || decision.action === "UPDATE_EXISTING_EVENT") !== (decision.event_id !== null)) throw validationError("schema_failure", "event_id_action_invalid");
+    if (decision.action === "DUPLICATE" && (!Number.isInteger(duplicateTarget) || !allowedPostIds.has(duplicateTarget) || decision.post_ids.includes(duplicateTarget))) throw validationError("duplicate_target_violation", "duplicate_target_invalid");
+    if (decision.action !== "DUPLICATE" && duplicateTarget !== null) throw validationError("duplicate_target_violation", "duplicate_target_action_invalid");
+    if ((decision.action === "MATCH_EXISTING_EVENT" || decision.action === "UPDATE_EXISTING_EVENT") !== (decision.event_id !== null)) throw validationError("action_reference_mismatch", "event_id_action_invalid");
   }
   if (assigned.size !== expected.size || [...expected].some((id) => !assigned.has(id))) throw validationError("missing_assignments", "report_coverage_invalid");
   return output.decisions.map((decision) => ({ ...decision, duplicate_of_post_id: decision.duplicate_of_post_id ?? null }));
@@ -490,10 +689,63 @@ function recordNebulaTelemetry(metrics, telemetry) {
   if (telemetry.routed_model) metrics.routed_model_distribution.set(telemetry.routed_model, (metrics.routed_model_distribution.get(telemetry.routed_model) || 0) + 1);
 }
 
-function addTokenMetrics(metrics, result, reportCount) {
+function recordCallResult(metrics, result, error, kind) {
+  const attempts = result?.attempts || error?.attempts || [];
+  metrics.logical_requests_total += 1;
+  for (const attempt of attempts) recordNebulaTelemetry(metrics, attempt.telemetry);
+
+  const first = attempts[0];
+  const initialSucceeded = Boolean(first?.structured_json && first.telemetry?.status >= 200 && first.telemetry?.status < 300);
+  if (kind === "primary") {
+    metrics.initial_logical_requests += 1;
+    if (initialSucceeded) metrics.initial_successes += 1;
+    else metrics.initial_failures += 1;
+    if (first?.telemetry?.status === 502) metrics.initial_http_502 += 1;
+    if (first?.telemetry?.status == null && first && first.telemetry.logical_error !== "timeout") metrics.initial_transport_failures += 1;
+    if (first?.telemetry?.status == null && first?.telemetry?.logical_error === "timeout") metrics.initial_timeouts += 1;
+    if (first?.telemetry?.status === 408) metrics.initial_timeouts += 1;
+    if (first?.telemetry?.latency_ms != null) metrics.initial_latency_samples.push(first.telemetry.latency_ms);
+  }
+  if (attempts.length > 1) {
+    metrics.transient_retry_calls += attempts.length - 1;
+    const last = attempts[attempts.length - 1];
+    const retrySucceeded = Boolean(last?.structured_json && last.telemetry?.status >= 200 && last.telemetry?.status < 300);
+    if (retrySucceeded) metrics.transient_retry_successes += 1;
+    else metrics.transient_retry_failures += 1;
+  }
+}
+
+function addTokenMetricsFromCall(metrics, result, kind = "primary") {
+  for (const attempt of result?.attempts || []) {
+    if (!attempt.structured_json) continue;
+    addTokenMetrics(metrics, {
+      prompt_tokens: attempt.prompt_tokens > 0 ? attempt.prompt_tokens : Math.ceil((result.prompt_tokens || 0)),
+      output_tokens: attempt.output_tokens > 0 ? attempt.output_tokens : Math.ceil((result.output_tokens || 0)),
+      prompt_tokens_estimated: attempt.prompt_tokens <= 0,
+      output_tokens_estimated: attempt.output_tokens <= 0
+    }, result.report_count || 0, kind);
+}
+}
+
+function isTransientBacktestStatus(status) {
+  return status === 502 || status === 503 || status === 504;
+}
+
+function isCorrectableBacktestError(error) {
+  return error?.backtestCode === "duplicate_target_violation"
+    || error?.backtestCode === "contradictory_assignment"
+    || error?.backtestCode === "missing_assignments"
+    || error?.backtestCode === "action_reference_mismatch";
+}
+
+async function waitForBacktestRetry() {
+  await new Promise((resolve) => setTimeout(resolve, 250));
+}
+
+function addTokenMetrics(metrics, result, reportCount, kind = "primary") {
   metrics.prompt_tokens += result.prompt_tokens;
   metrics.output_tokens += result.output_tokens;
-  metrics.token_samples.push({ reports: reportCount, input_tokens: result.prompt_tokens, output_tokens: result.output_tokens });
+  metrics.token_samples.push({ kind, reports: reportCount, input_tokens: result.prompt_tokens, output_tokens: result.output_tokens });
   if (result.prompt_tokens_estimated) metrics.estimated_prompt_tokens += result.prompt_tokens;
   if (result.output_tokens_estimated) metrics.estimated_output_tokens += result.output_tokens;
 }
@@ -506,6 +758,7 @@ function recordRejectedResponse(metrics, error) {
   else if (code === "schema_failure") metrics.schema_failures += 1;
   else if (code === "unknown_post_id") metrics.unknown_post_ids += 1;
   else if (code === "unknown_event_id") metrics.unknown_event_ids += 1;
+  else if (code === "duplicate_target_violation") metrics.duplicate_target_violations += 1;
   else if (code === "contradictory_assignment") metrics.contradictory_assignments += 1;
   else if (code === "missing_assignments") metrics.missing_assignments += 1;
 }
@@ -751,15 +1004,44 @@ function buildProductionProjection(rows, events, metrics, observedTotalCalls) {
   const primaryCallsPerHour = windowsPerHour * batchesPerWindow;
   const secondPassRate = metrics.primary_calls === 0 ? 0 : metrics.second_pass_calls / metrics.primary_calls;
   const secondPassCallsPerHour = primaryCallsPerHour * secondPassRate;
-  const averageFallbackAttemptsPerRequest = observedTotalCalls === 0 ? 0 : metrics.fallback_attempts / observedTotalCalls;
-  const fallbackOverheadPerHour = (primaryCallsPerHour + secondPassCallsPerHour) * averageFallbackAttemptsPerRequest;
-  const totalNebulaCallsPerHour = primaryCallsPerHour + secondPassCallsPerHour + fallbackOverheadPerHour;
-  const totalTokenReports = metrics.token_samples.reduce((sum, sample) => sum + sample.reports, 0);
-  const inputTokensPerReport = totalTokenReports === 0 ? 0 : metrics.token_samples.reduce((sum, sample) => sum + sample.input_tokens, 0) / totalTokenReports;
-  const outputTokensPerReport = totalTokenReports === 0 ? 0 : metrics.token_samples.reduce((sum, sample) => sum + sample.output_tokens, 0) / totalTokenReports;
-  const intelligenceCallsPerHour = primaryCallsPerHour + secondPassCallsPerHour;
-  const inputTokensPerHour = intelligenceCallsPerHour * effectiveReportsPerBatch * inputTokensPerReport;
-  const outputTokensPerHour = intelligenceCallsPerHour * effectiveReportsPerBatch * outputTokensPerReport;
+  const correctionRate = metrics.primary_calls === 0 ? 0 : metrics.contract_correction_calls / metrics.primary_calls;
+  const correctionCallsPerHour = primaryCallsPerHour * correctionRate;
+  const logicalCallsPerHour = primaryCallsPerHour + secondPassCallsPerHour + correctionCallsPerHour;
+  const retryRate = metrics.logical_requests_total === 0 ? 0 : metrics.transient_retry_calls / metrics.logical_requests_total;
+  const transientRetriesPerHour = logicalCallsPerHour * retryRate;
+  const observedPhysicalCalls = metrics.request_telemetry.length;
+  const averageFallbackAttemptsPerPhysicalCall = observedPhysicalCalls === 0 ? 0 : metrics.fallback_attempts / observedPhysicalCalls;
+  const providerFallbackAttemptsPerHour = logicalCallsPerHour * averageFallbackAttemptsPerPhysicalCall;
+  const physicalNebulaCallsPerHour = logicalCallsPerHour + transientRetriesPerHour;
+  const averageReportsPerKind = (kind) => {
+    const samples = metrics.token_samples.filter((sample) => sample.kind === kind && sample.reports > 0);
+    return samples.length === 0 ? effectiveReportsPerBatch : samples.reduce((sum, sample) => sum + sample.reports, 0) / samples.length;
+  };
+  const averageInputTokensPerReport = (kind) => {
+    const samples = metrics.token_samples.filter((sample) => sample.kind === kind && sample.reports > 0);
+    return samples.length === 0 ? 0 : samples.reduce((sum, sample) => sum + sample.input_tokens / sample.reports, 0) / samples.length;
+  };
+  const averageOutputTokensPerCall = (kind) => {
+    const samples = metrics.token_samples.filter((sample) => sample.kind === kind);
+    return samples.length === 0 ? 0 : samples.reduce((sum, sample) => sum + sample.output_tokens, 0) / samples.length;
+  };
+  const primaryInputTokensPerCall = effectiveReportsPerBatch * averageInputTokensPerReport("primary");
+  const secondInputTokensPerCall = averageInputTokensPerReport("ambiguity") * averageReportsPerKind("ambiguity");
+  const correctionInputTokensPerCall = averageInputTokensPerReport("correction") * averageReportsPerKind("correction");
+  const primaryOutputTokensPerCall = averageOutputTokensPerCall("primary");
+  const secondOutputTokensPerCall = averageOutputTokensPerCall("ambiguity");
+  const correctionOutputTokensPerCall = averageOutputTokensPerCall("correction");
+  const inputTokensPerLogicalHour = primaryCallsPerHour * primaryInputTokensPerCall
+    + secondPassCallsPerHour * secondInputTokensPerCall
+    + correctionCallsPerHour * correctionInputTokensPerCall;
+  const outputTokensPerLogicalHour = primaryCallsPerHour * primaryOutputTokensPerCall
+    + secondPassCallsPerHour * secondOutputTokensPerCall
+    + correctionCallsPerHour * correctionOutputTokensPerCall;
+  const successfulLogicalCalls = Math.max(1, metrics.token_samples.length);
+  const averageInputTokensPerPhysicalCall = metrics.prompt_tokens / successfulLogicalCalls;
+  const averageOutputTokensPerPhysicalCall = metrics.output_tokens / successfulLogicalCalls;
+  const inputTokensPerHour = inputTokensPerLogicalHour + transientRetriesPerHour * averageInputTokensPerPhysicalCall;
+  const outputTokensPerHour = outputTokensPerLogicalHour + transientRetriesPerHour * averageOutputTokensPerPhysicalCall;
 
   return {
     reports_per_hour: reportsPerHour,
@@ -774,17 +1056,22 @@ function buildProductionProjection(rows, events, metrics, observedTotalCalls) {
     batches_per_window: batchesPerWindow,
     primary_calls_per_hour: Number(primaryCallsPerHour.toFixed(3)),
     second_pass_calls_per_hour: Number(secondPassCallsPerHour.toFixed(3)),
-    fallback_overhead_per_hour: Number(fallbackOverheadPerHour.toFixed(3)),
-    total_nebula_calls_per_hour: Number(totalNebulaCallsPerHour.toFixed(3)),
+    contract_corrections_per_hour: Number(correctionCallsPerHour.toFixed(3)),
+    transient_retries_per_hour: Number(transientRetriesPerHour.toFixed(3)),
+    provider_fallback_attempts_per_hour: Number(providerFallbackAttemptsPerHour.toFixed(3)),
+    logical_radar_requests_per_hour: Number(logicalCallsPerHour.toFixed(3)),
+    physical_nebula_calls_per_hour: Number(physicalNebulaCallsPerHour.toFixed(3)),
+    total_nebula_calls_per_hour: Number(physicalNebulaCallsPerHour.toFixed(3)),
     input_tokens_per_hour: Number(inputTokensPerHour.toFixed(3)),
     output_tokens_per_hour: Number(outputTokensPerHour.toFixed(3)),
     primary_calls_per_day: Number((primaryCallsPerHour * 24).toFixed(3)),
-    total_calls_per_day: Number((totalNebulaCallsPerHour * 24).toFixed(3)),
+    total_calls_per_day: Number((physicalNebulaCallsPerHour * 24).toFixed(3)),
     input_tokens_per_day: Number((inputTokensPerHour * 24).toFixed(3)),
     output_tokens_per_day: Number((outputTokensPerHour * 24).toFixed(3)),
-    request_reduction_vs_341_individual_calls: Number((1 - totalNebulaCallsPerHour / reportsPerHour).toFixed(4)),
-    radar_http_request_reduction_vs_341: Number((1 - (primaryCallsPerHour + secondPassCallsPerHour) / reportsPerHour).toFixed(4)),
-    token_projection_basis: "successful backtest usage divided by reports represented, then scaled to effective target batch size"
+    request_reduction_vs_341_individual_calls: Number((1 - physicalNebulaCallsPerHour / reportsPerHour).toFixed(4)),
+    radar_logical_request_reduction_vs_341: Number((1 - logicalCallsPerHour / reportsPerHour).toFixed(4)),
+    token_projection_basis: "successful backtest token telemetry by request kind, scaled to 12 five-minute windows and observed retry rates",
+    workload: physicalNebulaCallsPerHour <= 100 && metrics.transient_retry_failures === 0 ? "SUSTAINABLE" : "BORDERLINE"
   };
 }
 

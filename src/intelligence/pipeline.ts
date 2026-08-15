@@ -12,11 +12,16 @@ import { normalizePersianText, lexicalOverlap } from "../normalization";
 import type { EditorialBatchJob, IntelligenceBatchJob } from "../queue";
 import { generateNebulaJson, NebulaError, type NebulaJsonResult, type NebulaUsage } from "./ai";
 import { ANALYSIS_STALE_AFTER_MS, floorFiveMinuteWindow, normalizeLegacyAnalysisStatus } from "./analysis-state";
-import { ambiguousPostIds, replaceAmbiguousDecisions, validateIntelligenceDecisions } from "./decision";
+import {
+  ambiguousPostIds,
+  isCorrectableIntelligenceValidationError,
+  replaceAmbiguousDecisions,
+  validateIntelligenceDecisions
+} from "./decision";
 import { extractEntityKeys, inferCategory } from "./similarity";
 import { calculateVerification, classifyOrigin, originGroupFor, persistVerification } from "./verification";
 import { scoreEvent } from "../editorial/scoring";
-import { intelligenceBatchOutputSchema } from "../contracts";
+import { intelligenceBatchOutputSchema, scopeIntelligenceBatchJsonSchema } from "../contracts";
 import type {
   EditorialCandidate,
   EventRow,
@@ -53,6 +58,22 @@ interface BatchApplyResult {
   existingMatches: number;
   duplicates: number;
   uncertain: number;
+}
+
+interface DecisionRequestOptions {
+  kind?: "primary" | "second_pass" | "correction";
+  expectedPostIds?: readonly number[];
+  duplicateTargetPostIds?: readonly number[];
+  priorDecisions?: IntelligenceDecision[];
+  correctionError?: string;
+}
+
+interface DecisionRequestResult extends NebulaJsonResult<{ decisions: IntelligenceDecision[] }> {
+  suppliedEventIds: number[];
+}
+
+interface CorrectionState {
+  used: boolean;
 }
 
 const INTELLIGENCE_SYSTEM_PROMPT = `You are Radar's Persian-news event intelligence layer.
@@ -212,35 +233,70 @@ export async function processIntelligenceBatch(env: Env, job: IntelligenceBatchJ
     const activeEvents = await listActiveEvents(env.DB, config.intelligenceMaxActiveEvents);
     const primary = await requestBatchDecisions(env, reports, activeEvents, "intelligence");
     if (!primary) throw new NebulaError("intelligence_primary_unavailable");
-    const knownEventIds = new Set(activeEvents.map((event) => event.event_id));
-    let decisions = validateIntelligenceDecisions(primary.data, reports.map((report) => report.id), knownEventIds);
+    const correctionState: CorrectionState = { used: false };
+    const allReportIds = reports.map((report) => report.id);
+    const primaryValidation = await validateDecisionSetWithCorrection(
+      env,
+      reports,
+      activeEvents,
+      "intelligence",
+      primary.data,
+      allReportIds,
+      new Set(primary.suppliedEventIds),
+      new Set(allReportIds),
+      correctionState
+    );
+    let decisions = primaryValidation.decisions;
     const uncertainIds = ambiguousPostIds(decisions, config.intelligenceAmbiguityThreshold);
-    const nebulaUsages: NebulaUsage[] = [primary.usage];
-    let promptTokens = primary.usage.promptTokens;
-    let completionTokens = primary.usage.completionTokens;
+    const nebulaUsages: NebulaUsage[] = [primary.usage, ...(primaryValidation.correctionUsage ? [primaryValidation.correctionUsage] : [])];
+    let promptTokens = nebulaUsages.reduce((sum, usage) => sum + usage.promptTokens, 0);
+    let completionTokens = nebulaUsages.reduce((sum, usage) => sum + usage.completionTokens, 0);
 
     if (uncertainIds.length > 0) {
       const focusedEvents = activeEvents.filter((event) => decisions.some((decision) => decision.event_id === event.event_id && uncertainIds.some((id) => decision.post_ids.includes(id)))).slice(0, 5);
-      const second = await requestBatchDecisions(env, reports.filter((report) => uncertainIds.includes(report.id)), focusedEvents, "intelligence_second_pass", decisions.filter((decision) => decision.post_ids.some((id) => uncertainIds.includes(id))));
+      const focusedReports = reports.filter((report) => uncertainIds.includes(report.id));
+      const second = await requestBatchDecisions(env, focusedReports, focusedEvents, "intelligence_second_pass", {
+        kind: "second_pass",
+        expectedPostIds: uncertainIds,
+        duplicateTargetPostIds: allReportIds,
+        priorDecisions: decisions.filter((decision) => decision.post_ids.some((id) => uncertainIds.includes(id)))
+      });
       if (!second) throw new NebulaError("intelligence_second_pass_unavailable");
-      const resolved = validateIntelligenceDecisions(
+      const secondValidation = await validateDecisionSetWithCorrection(
+        env,
+        focusedReports,
+        focusedEvents,
+        "intelligence_second_pass",
         second.data,
         uncertainIds,
-        knownEventIds,
-        new Set(reports.map((report) => report.id))
+        new Set(second.suppliedEventIds),
+        new Set(allReportIds),
+        correctionState
       );
-      decisions = replaceAmbiguousDecisions(decisions, resolved, new Set(uncertainIds));
+      decisions = replaceAmbiguousDecisions(decisions, secondValidation.decisions, new Set(uncertainIds));
       nebulaUsages.push(second.usage);
-      promptTokens += second.usage.promptTokens;
-      completionTokens += second.usage.completionTokens;
+      if (secondValidation.correctionUsage) nebulaUsages.push(secondValidation.correctionUsage);
+      promptTokens = nebulaUsages.reduce((sum, usage) => sum + usage.promptTokens, 0);
+      completionTokens = nebulaUsages.reduce((sum, usage) => sum + usage.completionTokens, 0);
     }
 
-    validateIntelligenceDecisions(
+    const finalValidation = await validateDecisionSetWithCorrection(
+      env,
+      reports,
+      activeEvents,
+      "intelligence",
       { decisions },
-      reports.map((report) => report.id),
-      knownEventIds,
-      new Set(reports.map((report) => report.id))
+      allReportIds,
+      new Set(activeEvents.map((event) => event.event_id)),
+      new Set(allReportIds),
+      correctionState
     );
+    decisions = finalValidation.decisions;
+    if (finalValidation.correctionUsage) {
+      nebulaUsages.push(finalValidation.correctionUsage);
+      promptTokens += finalValidation.correctionUsage.promptTokens;
+      completionTokens += finalValidation.correctionUsage.completionTokens;
+    }
     const outcome = await applyBatchDecisions(env, batch.id, reports, decisions);
     await completeBatch(env.DB, batch.id, summarizeNebulaUsage(nebulaUsages), promptTokens, completionTokens);
     await safeIncrementCounter(env.DB, "intelligence_batches");
@@ -261,9 +317,11 @@ async function requestBatchDecisions(
   reports: BatchReportRow[],
   activeEvents: ActiveEventSummary[],
   stage: "intelligence" | "intelligence_second_pass",
-  priorDecisions: IntelligenceDecision[] = []
-): Promise<NebulaJsonResult<{ decisions: IntelligenceDecision[] }> | null> {
+  options: DecisionRequestOptions = {}
+): Promise<DecisionRequestResult | null> {
   const config = runtimeConfig(env);
+  const expectedPostIds = [...(options.expectedPostIds ?? reports.map((report) => report.id))];
+  const duplicateTargetPostIds = [...(options.duplicateTargetPostIds ?? reports.map((report) => report.id))];
   const promptBase = {
     task: "Classify every supplied report exactly once. Group reports that describe the same real-world event.",
     output_rules: {
@@ -273,7 +331,11 @@ async function requestBatchDecisions(
       independent_confirmations: "Never return or calculate this field. Radar computes it from origin groups.",
       coverage: "Every report id must appear in exactly one decision. Do not omit or repeat ids."
     },
-    prior_decisions: priorDecisions.length > 0 ? priorDecisions : undefined,
+    prior_decisions: options.priorDecisions && options.priorDecisions.length > 0 ? options.priorDecisions : undefined,
+    correction: options.kind === "correction" ? {
+      validation_error: options.correctionError,
+      instruction: "Correct only the deterministic decision-graph error. Use only supplied report and event IDs. Do not invent facts, IDs, or relationships."
+    } : undefined,
     reports: reports.map((report) => ({
       post_id: report.id,
       source_id: report.source_id,
@@ -300,10 +362,20 @@ async function requestBatchDecisions(
     prompt = JSON.stringify({ ...promptBase, active_events: eventPayload.slice(0, eventLimit) });
   }
   if (prompt.length + INTELLIGENCE_SYSTEM_PROMPT.length > config.intelligenceMaxPayloadChars) throw new NebulaError("intelligence_payload_too_large");
-  const result = await generateNebulaJson(env, stage, INTELLIGENCE_SYSTEM_PROMPT, prompt, intelligenceBatchOutputSchema, 2_000);
+  const suppliedEventIds = eventPayload.slice(0, eventLimit).map((event) => event.event_id);
+  const result = await generateNebulaJson(
+    env,
+    stage,
+    INTELLIGENCE_SYSTEM_PROMPT,
+    prompt,
+    intelligenceBatchOutputSchema,
+    2_000,
+    { responseSchema: scopeIntelligenceBatchJsonSchema(expectedPostIds, suppliedEventIds, duplicateTargetPostIds) }
+  );
   if (!result) return null;
   return {
     ...result,
+    suppliedEventIds,
     data: {
       decisions: result.data.decisions.map((decision) => ({
         ...decision,
@@ -311,6 +383,47 @@ async function requestBatchDecisions(
       }))
     }
   };
+}
+
+async function validateDecisionSetWithCorrection(
+  env: Env,
+  reports: BatchReportRow[],
+  activeEvents: ActiveEventSummary[],
+  stage: "intelligence" | "intelligence_second_pass",
+  value: unknown,
+  expectedPostIds: number[],
+  knownEventIds: ReadonlySet<number>,
+  allowedPostIds: ReadonlySet<number>,
+  correctionState: CorrectionState
+): Promise<{ decisions: IntelligenceDecision[]; correctionUsage?: NebulaUsage }> {
+  try {
+    return { decisions: validateIntelligenceDecisions(value, expectedPostIds, knownEventIds, allowedPostIds) };
+  } catch (error) {
+    if (!isCorrectableIntelligenceValidationError(error) || correctionState.used) throw error;
+    correctionState.used = true;
+    await safeIncrementCounter(env.DB, "nebula_contract_correction_calls");
+    let correction: DecisionRequestResult | null = null;
+    try {
+      correction = await requestBatchDecisions(env, reports, activeEvents, stage, {
+        kind: "correction",
+        expectedPostIds,
+        duplicateTargetPostIds: [...allowedPostIds],
+        priorDecisions: isDecisionOutput(value) ? value.decisions : [],
+        correctionError: error.message
+      });
+      if (!correction) throw new NebulaError("intelligence_contract_correction_unavailable");
+      const decisions = validateIntelligenceDecisions(correction.data, expectedPostIds, knownEventIds, allowedPostIds);
+      await safeIncrementCounter(env.DB, "nebula_contract_correction_successes");
+      return { decisions, correctionUsage: correction.usage };
+    } catch (correctionError) {
+      await safeIncrementCounter(env.DB, "nebula_contract_correction_failures");
+      throw correctionError;
+    }
+  }
+}
+
+function isDecisionOutput(value: unknown): value is { decisions: IntelligenceDecision[] } {
+  return typeof value === "object" && value !== null && "decisions" in value && Array.isArray(value.decisions);
 }
 
 async function claimBatch(db: D1Database, batchId: number): Promise<boolean> {
@@ -425,7 +538,9 @@ function summarizeNebulaUsage(usages: NebulaUsage[]): string | null {
       fallback_attempts: usage.fallbackAttempts,
       request_id: usage.requestId,
       status: usage.status,
-      latency_ms: usage.latencyMs
+      latency_ms: usage.latencyMs,
+      logical_attempt: usage.logicalAttempt,
+      logical_retry: usage.logicalRetry
     }))
   });
 }

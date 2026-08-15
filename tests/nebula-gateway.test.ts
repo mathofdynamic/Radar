@@ -1,6 +1,6 @@
 import { describe, expect, it, vi } from "vitest";
 import { z } from "zod";
-import { intelligenceBatchJsonSchema, intelligenceBatchOutputSchema } from "../src/contracts";
+import { intelligenceBatchJsonSchema, intelligenceBatchOutputSchema, scopeIntelligenceBatchJsonSchema } from "../src/contracts";
 import { generateNebulaJson, NebulaError, parseRoutedVia } from "../src/intelligence/ai";
 import { runtimeConfig } from "../src/config";
 import { ANALYSIS_STALE_AFTER_MS } from "../src/intelligence/analysis-state";
@@ -90,6 +90,25 @@ describe("Nebula gateway", () => {
     }
   });
 
+  it("sends the request-scoped JSON Schema rather than only the static contract", async () => {
+    const fetchMock = vi.spyOn(globalThis, "fetch").mockResolvedValue(new Response(JSON.stringify({
+      choices: [{ message: { content: JSON.stringify(validOutput) } }]
+    }), { status: 200 }));
+    try {
+      await generateNebulaJson(fakeEnv(), "intelligence", "system", "user", intelligenceBatchOutputSchema, 1_600, {
+        responseSchema: scopeIntelligenceBatchJsonSchema([8101, 8102], [1042], [8101, 8102, 8103])
+      });
+      const request = fetchMock.mock.calls[0]?.[1] as RequestInit;
+      const body = JSON.parse(String(request.body)) as { response_format: { json_schema: { schema: { properties: { decisions: { items: { properties: Record<string, { items?: { enum?: number[] }; anyOf?: Array<{ enum?: number[]; type?: string }> }> } } } } } } };
+      const decision = body.response_format.json_schema.schema.properties.decisions.items;
+      expect(decision.properties.post_ids.items?.enum).toEqual([8101, 8102]);
+      expect(decision.properties.event_id.anyOf?.[0]?.enum).toEqual([1042]);
+      expect(decision.properties.duplicate_of_post_id.anyOf?.[0]?.enum).toEqual([8101, 8102, 8103]);
+    } finally {
+      fetchMock.mockRestore();
+    }
+  });
+
   it("keeps editorial text on auto and json_object", async () => {
     const fetchMock = vi.spyOn(globalThis, "fetch").mockResolvedValue(new Response(JSON.stringify({
       model: "auto",
@@ -143,6 +162,45 @@ describe("Nebula gateway", () => {
     try {
       await expect(generateNebulaJson(fakeEnv(), "intelligence", "system", "user", intelligenceBatchOutputSchema))
         .rejects.toMatchObject({ name: "NebulaError", status, message: `nebula_http_${status}` });
+    } finally {
+      fetchMock.mockRestore();
+    }
+  });
+
+  it("retries one transient 502 and returns the successful logical result", async () => {
+    const fetchMock = vi.spyOn(globalThis, "fetch")
+      .mockResolvedValueOnce(new Response("gateway failure", { status: 502 }))
+      .mockResolvedValueOnce(new Response(JSON.stringify({ choices: [{ message: { content: JSON.stringify(validOutput) } }] }), { status: 200 }));
+    try {
+      const result = await generateNebulaJson(fakeEnv(), "intelligence", "system", "user", intelligenceBatchOutputSchema);
+      expect(result?.data).toEqual(validOutput);
+      expect(result?.usage.logicalRetry).toBe(true);
+      expect(result?.usage.logicalAttempt).toBe(2);
+      expect(fetchMock).toHaveBeenCalledTimes(2);
+    } finally {
+      fetchMock.mockRestore();
+    }
+  });
+
+  it("retries one transport failure and stops after a second failure", async () => {
+    const fetchMock = vi.spyOn(globalThis, "fetch")
+      .mockRejectedValueOnce(new TypeError("network down"))
+      .mockRejectedValueOnce(new TypeError("network still down"));
+    try {
+      await expect(generateNebulaJson(fakeEnv(), "intelligence", "system", "user", intelligenceBatchOutputSchema))
+        .rejects.toMatchObject({ name: "NebulaError" });
+      expect(fetchMock).toHaveBeenCalledTimes(2);
+    } finally {
+      fetchMock.mockRestore();
+    }
+  });
+
+  it.each([400, 401, 403, 422])("does not retry non-transient HTTP %s", async (status) => {
+    const fetchMock = vi.spyOn(globalThis, "fetch").mockResolvedValue(new Response("client failure", { status }));
+    try {
+      await expect(generateNebulaJson(fakeEnv(), "intelligence", "system", "user", intelligenceBatchOutputSchema))
+        .rejects.toMatchObject({ name: "NebulaError", status });
+      expect(fetchMock).toHaveBeenCalledTimes(1);
     } finally {
       fetchMock.mockRestore();
     }

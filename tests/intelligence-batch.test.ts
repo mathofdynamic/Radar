@@ -1,9 +1,12 @@
 import { describe, expect, it } from "vitest";
 import {
   ambiguousPostIds,
+  IntelligenceValidationError,
+  isCorrectableIntelligenceValidationError,
   replaceAmbiguousDecisions,
   validateIntelligenceDecisions
 } from "../src/intelligence/decision";
+import { scopeIntelligenceBatchJsonSchema } from "../src/contracts";
 
 const newEvent = (postIds: number[], reason = "same event") => ({
   post_ids: postIds,
@@ -16,7 +19,39 @@ const newEvent = (postIds: number[], reason = "same event") => ({
   reason
 });
 
+type ScopedSchema = {
+  properties: {
+    decisions: {
+      items: {
+        properties: Record<string, { items?: { enum?: number[] }; anyOf?: Array<{ enum?: number[]; type?: string }> }>;
+      };
+    };
+  };
+};
+
 describe("Nebula batch decision validation", () => {
+  it("scopes post, event, and duplicate references to the current request", () => {
+    const schema = scopeIntelligenceBatchJsonSchema([101, 102, 103], [50, 51]) as unknown as ScopedSchema;
+    const decision = schema.properties.decisions.items;
+    expect(decision.properties.post_ids.items!.enum).toEqual([101, 102, 103]);
+    expect(decision.properties.event_id.anyOf![0].enum).toEqual([50, 51]);
+    expect(decision.properties.duplicate_of_post_id.anyOf![0].enum).toEqual([101, 102, 103]);
+    expect(decision.properties.post_ids.items!.enum).not.toContain(999);
+    expect(decision.properties.event_id.anyOf![0].enum).not.toContain(999);
+    expect(decision.properties.duplicate_of_post_id.anyOf![0].enum).not.toContain(999);
+  });
+
+  it("forces event_id to null when the request supplies no active events", () => {
+    const schema = scopeIntelligenceBatchJsonSchema([101, 102], []) as unknown as ScopedSchema;
+    expect(schema.properties.decisions.items.properties.event_id).toEqual({ type: "null" });
+  });
+
+  it("keeps second-pass post coverage focused while allowing broader duplicate targets", () => {
+    const schema = scopeIntelligenceBatchJsonSchema([101], [50], [101, 102, 103]) as unknown as ScopedSchema;
+    const decision = schema.properties.decisions.items;
+    expect(decision.properties.post_ids.items!.enum).toEqual([101]);
+    expect(decision.properties.duplicate_of_post_id.anyOf![0].enum).toEqual([101, 102, 103]);
+  });
   it("allows several reports to create exactly one new event decision", () => {
     const decisions = validateIntelligenceDecisions(
       { decisions: [newEvent([8101, 8104, 8110])] },
@@ -105,6 +140,33 @@ describe("Nebula batch decision validation", () => {
       new Set(),
       new Set([8101, 8102])
     )).toThrow("intelligence_invalid_duplicate_target");
+  });
+
+  it("classifies only cross-decision contract violations as correctable", () => {
+    let error: unknown;
+    try {
+      validateIntelligenceDecisions(
+        {
+          decisions: [
+            { ...newEvent([8101]), action: "NOISE" as const },
+            { post_ids: [8102], action: "DUPLICATE", event_id: null, duplicate_of_post_id: 8101, confidence: 0.9, canonical_fact: "copy", category: "IRAN", reason: "copy" }
+          ]
+        },
+        [8101, 8102],
+        new Set(),
+        new Set([8101, 8102])
+      );
+    } catch (caught) {
+      error = caught;
+    }
+    expect(error).toBeInstanceOf(IntelligenceValidationError);
+    expect(isCorrectableIntelligenceValidationError(error)).toBe(true);
+
+    expect(() => validateIntelligenceDecisions(
+      { decisions: [{ ...newEvent([8101]), post_ids: [999] }] },
+      [8101],
+      new Set()
+    )).toThrow("intelligence_unknown_post_id");
   });
 
   it("handles bounded ambiguity resolution and preserves separate events when unresolved", () => {

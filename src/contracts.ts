@@ -58,6 +58,50 @@ export type IntelligenceBatchOutput = z.infer<typeof intelligenceBatchOutputSche
 /** Shared strict descriptor consumed by Nebula and the read-only backtest. */
 export { intelligenceBatchJsonSchema };
 
+type IntelligenceSchemaNode = {
+  properties: {
+    decisions: {
+      items: {
+        properties: {
+          post_ids: { items: Record<string, unknown> };
+          event_id: Record<string, unknown>;
+          duplicate_of_post_id: Record<string, unknown>;
+        };
+      };
+    };
+  };
+};
+
+/**
+ * Narrows the shared contract to the identifiers present in one request.
+ * Zod remains authoritative because cross-decision relationships are not
+ * expressible in the gateway grammar without making the schema ambiguous.
+ */
+export function scopeIntelligenceBatchJsonSchema(
+  allowedPostIds: readonly number[],
+  allowedEventIds: readonly number[],
+  duplicateTargetPostIds: readonly number[] = allowedPostIds
+): Record<string, unknown> {
+  const schema = JSON.parse(JSON.stringify(intelligenceBatchJsonSchema)) as IntelligenceSchemaNode & Record<string, unknown>;
+  const decision = schema.properties.decisions.items;
+  const postIds = uniquePositiveIds(allowedPostIds);
+  const eventIds = uniquePositiveIds(allowedEventIds);
+  const duplicateTargetIds = uniquePositiveIds(duplicateTargetPostIds);
+
+  decision.properties.post_ids.items = { type: "integer", enum: postIds };
+  decision.properties.event_id = eventIds.length > 0
+    ? { anyOf: [{ type: "integer", enum: eventIds }, { type: "null" }] }
+    : { type: "null" };
+  decision.properties.duplicate_of_post_id = duplicateTargetIds.length > 0
+    ? { anyOf: [{ type: "integer", enum: duplicateTargetIds }, { type: "null" }] }
+    : { type: "null" };
+  return schema;
+}
+
+function uniquePositiveIds(values: readonly number[]): number[] {
+  return [...new Set(values)].filter((value) => Number.isSafeInteger(value) && value > 0).sort((left, right) => left - right);
+}
+
 export const polledPostSchema = z.object({
   sourceId: z.number().int().positive(),
   sourceKey: z.string().min(1),
