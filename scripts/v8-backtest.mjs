@@ -19,6 +19,11 @@ const BACKTEST_MODE = process.env.RADAR_BACKTEST_MODE || "baseline";
 const QUEUE_REPLAY_ENABLED = process.env.RADAR_BACKTEST_QUEUE_REPLAY !== "0";
 const BASELINE_MANIFEST_PATH = path.resolve(process.cwd(), "scripts", "fixtures", "v8-baseline-500.json");
 const DIAGNOSTIC_ROOT = path.resolve(process.cwd(), "diagnostics", "v8");
+const TOKEN_SWEEP_CEILINGS = [2_000, 4_000, 6_000, 8_000, 12_000];
+const TOKEN_SWEEP_REQUESTS = Math.max(5, Math.min(10, Number(process.env.RADAR_TOKEN_SWEEP_REQUESTS || 5)));
+const TOKEN_SWEEP_GROUP_INDEX = Math.max(0, Math.min(9, Number(process.env.RADAR_TOKEN_SWEEP_GROUP_INDEX || 5)));
+const TOKEN_SWEEP_FIXTURE_PATH = path.join(DIAGNOSTIC_ROOT, "token-sweep-fixture-cap20.json");
+const TOKEN_SWEEP_ARTIFACT_PATH = path.join(DIAGNOSTIC_ROOT, "token-sweep.json");
 const REVIEW_TEXT_CHARS = 320;
 const REVIEW_STOP_WORDS = new Set(["the", "and", "for", "with", "from", "that", "this", "در", "از", "به", "با", "برای", "که", "این", "آن"]);
 const CATEGORIES = new Set(["IRAN", "WORLD", "POLITICS", "WAR_SECURITY", "SOCIETY", "ECONOMY", "TECHNOLOGY"]);
@@ -247,6 +252,20 @@ if (BACKTEST_MODE === "high-density") {
     event_cap: EVENT_CAP,
     reports_per_request: 28,
     ...highDensity,
+    mutation: "none"
+  }, null, 2));
+  process.exit(0);
+}
+
+if (BACKTEST_MODE === "token-sweep") {
+  const tokenSweep = await runTokenSweepExperiment(reports, activeEvents, EVENT_CAP);
+  fs.mkdirSync(DIAGNOSTIC_ROOT, { recursive: true });
+  fs.writeFileSync(TOKEN_SWEEP_ARTIFACT_PATH, `${JSON.stringify(tokenSweep, null, 2)}\n`, "utf8");
+  console.log(JSON.stringify({
+    mode: BACKTEST_MODE,
+    event_cap: EVENT_CAP,
+    requests_per_ceiling: TOKEN_SWEEP_REQUESTS,
+    ...tokenSweep,
     mutation: "none"
   }, null, 2));
   process.exit(0);
@@ -740,6 +759,391 @@ function classifyDuplicateGraphs(outputs, allowedPostIds) {
   });
 }
 
+function buildHighDensityGroups(rows, reportCount = 28, count = 10) {
+  const chronological = [...rows].sort((left, right) => String(left.published_at || left.observed_at).localeCompare(String(right.published_at || right.observed_at)) || left.id - right.id);
+  if (chronological.length < reportCount) throw new Error(`high_density_fixture_insufficient_reports:${chronological.length}:${reportCount}`);
+  const groups = [];
+  for (let index = 0; index < count; index += 1) {
+    const start = Math.floor(index * (chronological.length - reportCount) / Math.max(1, count - 1));
+    groups.push(chronological.slice(start, start + reportCount));
+  }
+  return groups;
+}
+
+function buildHighDensityBatch(group) {
+  const date = new Date(group[0].published_at || group[0].observed_at);
+  date.setUTCSeconds(0, 0);
+  date.setUTCMinutes(Math.floor(date.getUTCMinutes() / 5) * 5);
+  return {
+    window_start: new Date(date.getTime() - 5 * 60 * 1_000).toISOString(),
+    window_end: date.toISOString(),
+    reports: group
+  };
+}
+
+function buildIntelligenceRequest(batchReports, events, pass = "primary", options = {}, maxTokens = 2_000) {
+  const expectedPostIds = options.expectedPostIds || batchReports.map((report) => report.id);
+  const duplicateTargetPostIds = options.duplicateTargetPostIds || batchReports.map((report) => report.id);
+  const userPrompt = buildUserPrompt(batchReports, events, pass, options);
+  if (userPrompt.length + INTELLIGENCE_SYSTEM_PROMPT.length > MAX_PAYLOAD_CHARS) throw new Error("backtest_payload_too_large");
+  const responseSchema = scopeIntelligenceBatchJsonSchema(expectedPostIds, events.map((event) => event.event_id), duplicateTargetPostIds);
+  return {
+    requestPayload: {
+      model: "radar-fast",
+      messages: [
+        { role: "system", content: INTELLIGENCE_SYSTEM_PROMPT },
+        { role: "user", content: userPrompt }
+      ],
+      response_format: {
+        type: "json_schema",
+        json_schema: {
+          name: "radar_intelligence_batch",
+          strict: true,
+          schema: responseSchema
+        }
+      },
+      temperature: 0.1,
+      max_tokens: maxTokens
+    },
+    requestMetadata: {
+      prompt_chars: userPrompt.length,
+      system_prompt_chars: INTELLIGENCE_SYSTEM_PROMPT.length,
+      schema_chars: JSON.stringify(responseSchema).length,
+      active_event_count: events.length,
+      active_event_ids: events.map((event) => event.event_id),
+      report_count: batchReports.length,
+      pass
+    },
+    responseSchema,
+    userPrompt
+  };
+}
+
+async function runTokenSweepExperiment(rows, events, cap) {
+  if (cap !== 20) throw new Error("token_sweep_requires_event_cap_20");
+  const groups = buildHighDensityGroups(rows, 28, 10);
+  const groupIndex = Math.min(TOKEN_SWEEP_GROUP_INDEX, groups.length - 1);
+  const group = groups[groupIndex];
+  const batch = buildHighDensityBatch(group);
+  const selectedEvents = selectEventsForBatch(events, batch, cap);
+  const baseRequest = buildIntelligenceRequest(group, selectedEvents, "primary", {}, 2_000);
+  const fixture = {
+    version: 1,
+    fixture: "v8-high-density-28-cap20",
+    selection: {
+      method: "chronological_evenly_spaced_high_density_group",
+      group_index: groupIndex,
+      group_count: groups.length,
+      report_count: group.length,
+      event_cap: cap
+    },
+    batch: {
+      window_start: batch.window_start,
+      window_end: batch.window_end,
+      report_ids: group.map((report) => report.id),
+      report_count: group.length
+    },
+    active_event_ids: selectedEvents.map((event) => event.event_id),
+    request_metadata: baseRequest.requestMetadata,
+    request_payload: baseRequest.requestPayload,
+    note: "Local diagnostic fixture. Contains the exact prompt and schema but no Authorization header or API key."
+  };
+  fs.mkdirSync(DIAGNOSTIC_ROOT, { recursive: true });
+  fs.writeFileSync(TOKEN_SWEEP_FIXTURE_PATH, `${JSON.stringify(fixture, null, 2)}\n`, "utf8");
+
+  const ceilingResults = [];
+  for (const maxTokens of TOKEN_SWEEP_CEILINGS) {
+    const requests = await Promise.all(Array.from({ length: TOKEN_SWEEP_REQUESTS }, (_, requestIndex) => runSingleTokenDiagnosticRequest({
+        requestPayload: { ...baseRequest.requestPayload, max_tokens: maxTokens },
+        requestMetadata: baseRequest.requestMetadata,
+        reportIds: group.map((report) => report.id),
+        activeEventIds: selectedEvents.map((event) => event.event_id),
+        maxTokens,
+        phase: "token_sweep",
+        requestIndex
+      })));
+    ceilingResults.push(summarizeTokenSweepCeiling(maxTokens, requests));
+  }
+
+  const reliable = ceilingResults.find((result) => result.http_success === result.requests && result.schema_valid === result.requests) || null;
+  const thirtyTwoReport = reliable
+    ? await runThirtyTwoReportValidation(rows, events, cap, reliable.max_tokens, groupIndex)
+    : { skipped: true, reason: "no_token_ceiling_produced_100_percent_http_and_schema_success_for_fixed_28_report_fixture" };
+
+  return {
+    fixed_fixture: {
+      path: path.relative(process.cwd(), TOKEN_SWEEP_FIXTURE_PATH),
+      report_count: group.length,
+      event_count: selectedEvents.length,
+      report_ids: group.map((report) => report.id),
+      active_event_ids: selectedEvents.map((event) => event.event_id),
+      window_start: batch.window_start,
+      window_end: batch.window_end,
+      prompt_chars: baseRequest.requestMetadata.prompt_chars,
+      system_prompt_chars: baseRequest.requestMetadata.system_prompt_chars,
+      schema_chars: baseRequest.requestMetadata.schema_chars
+    },
+    token_sweep_requests_per_ceiling: TOKEN_SWEEP_REQUESTS,
+    token_sweep: ceilingResults,
+    smallest_reliable_token_ceiling: reliable?.max_tokens ?? null,
+    thirty_two_report_validation: thirtyTwoReport,
+    diagnostic_contract: {
+      logical_retry: "disabled",
+      request_contract: "same messages, schema, model, temperature, and report/event context; only max_tokens changes",
+      response_contract: "unchanged radar_intelligence_batch JSON Schema"
+    }
+  };
+}
+
+async function runThirtyTwoReportValidation(rows, events, cap, maxTokens, groupIndex) {
+  const groups = buildHighDensityGroups(rows, 32, 10);
+  const group = groups[Math.min(groupIndex, groups.length - 1)];
+  const batch = buildHighDensityBatch(group);
+  const selectedEvents = selectEventsForBatch(events, batch, cap);
+  const request = buildIntelligenceRequest(group, selectedEvents, "primary", {}, maxTokens);
+  const requests = await Promise.all(Array.from({ length: TOKEN_SWEEP_REQUESTS }, (_, requestIndex) => runSingleTokenDiagnosticRequest({
+      requestPayload: request.requestPayload,
+      requestMetadata: request.requestMetadata,
+      reportIds: group.map((report) => report.id),
+      activeEventIds: selectedEvents.map((event) => event.event_id),
+      maxTokens,
+      phase: "thirty_two_report",
+      requestIndex
+    })));
+  return {
+    skipped: false,
+    max_tokens: maxTokens,
+    group_index: Math.min(groupIndex, groups.length - 1),
+    report_count: group.length,
+    active_event_count: selectedEvents.length,
+    report_ids: group.map((report) => report.id),
+    active_event_ids: selectedEvents.map((event) => event.event_id),
+    prompt_chars: request.requestMetadata.prompt_chars,
+    schema_chars: request.requestMetadata.schema_chars,
+    ...summarizeTokenSweepCeiling(maxTokens, requests),
+    requests_detail: requests
+  };
+}
+
+async function runSingleTokenDiagnosticRequest({ requestPayload, requestMetadata, reportIds, activeEventIds, maxTokens, phase, requestIndex }) {
+  const startedAt = Date.now();
+  try {
+    const { response, body, body_text: bodyText } = await fetchNebulaResponse(`${BASE_URL}/chat/completions`, {
+      method: "POST",
+      headers: { accept: "application/json", "content-type": "application/json", authorization: `Bearer ${API_KEY}` },
+      body: JSON.stringify(requestPayload)
+    });
+    const telemetry = { ...buildNebulaTelemetry(response, body, startedAt, "radar-fast"), ...requestMetadata };
+    const output = parseOutput(body);
+    let validationError = null;
+    let schemaValid = false;
+    if (response.ok && output) {
+      try {
+        schemaValid = validateQueueReplayOutput(output, { report_ids: reportIds, active_event_ids: activeEventIds });
+        if (!schemaValid) validationError = "structured_schema_invalid";
+      } catch (error) {
+        validationError = error instanceof Error ? error.message : String(error);
+      }
+    }
+    const usage = body?.usage && typeof body.usage === "object" ? body.usage : {};
+    const promptTokens = Number(usage.prompt_tokens || 0);
+    const completionTokens = Number(usage.completion_tokens || usage.output_tokens || 0);
+    const content = body?.choices?.[0]?.message?.content;
+    const serializedOutput = output ? JSON.stringify(output) : "";
+    const errorInfo = extractNebulaErrorInfo(body);
+    const failureCategory = classifyTokenDiagnosticFailure(response.status, errorInfo.error_code, output, schemaValid, validationError);
+    const result = {
+      phase,
+      request_index: requestIndex,
+      max_tokens: maxTokens,
+      status: response.status,
+      ok: response.ok,
+      schema_valid: schemaValid,
+      provider: telemetry.provider,
+      routed_model: telemetry.routed_model,
+      fallback_attempts: telemetry.fallback_attempts,
+      request_id: telemetry.request_id,
+      latency_ms: telemetry.latency_ms,
+      prompt_chars: requestMetadata.prompt_chars,
+      system_prompt_chars: requestMetadata.system_prompt_chars,
+      schema_chars: requestMetadata.schema_chars,
+      report_count: requestMetadata.report_count,
+      active_event_count: requestMetadata.active_event_count,
+      prompt_tokens: Number.isFinite(promptTokens) ? promptTokens : 0,
+      completion_tokens: Number.isFinite(completionTokens) ? completionTokens : 0,
+      finish_reason: extractFinishReasons(body),
+      content_chars: typeof content === "string" ? content.length : null,
+      serialized_output_chars: serializedOutput.length || null,
+      decision_count: Array.isArray(output?.decisions) ? output.decisions.length : null,
+      reports_represented: Array.isArray(output?.decisions) ? output.decisions.reduce((sum, decision) => sum + (Array.isArray(decision?.post_ids) ? decision.post_ids.length : 0), 0) : null,
+      failure_category: failureCategory,
+      validation_error: validationError,
+      error_code: errorInfo.error_code,
+      error_message: errorInfo.error_message,
+      error_last_status: errorInfo.error_last_status,
+      error_last_error: errorInfo.error_last_error,
+      error_attempts: errorInfo.error_attempts,
+      provider_attempts: normalizeGatewayAttempts(errorInfo.error_attempts),
+      response_body_excerpt: failureCategory ? safeDiagnosticJson(body, bodyText) : null
+    };
+    return result;
+  } catch (error) {
+    const diagnostics = describeDiagnosticError(error);
+    return {
+      phase,
+      request_index: requestIndex,
+      max_tokens: maxTokens,
+      status: null,
+      ok: false,
+      schema_valid: false,
+      provider: null,
+      routed_model: null,
+      fallback_attempts: 0,
+      request_id: null,
+      latency_ms: Date.now() - startedAt,
+      prompt_chars: requestMetadata.prompt_chars,
+      system_prompt_chars: requestMetadata.system_prompt_chars,
+      schema_chars: requestMetadata.schema_chars,
+      report_count: requestMetadata.report_count,
+      active_event_count: requestMetadata.active_event_count,
+      prompt_tokens: 0,
+      completion_tokens: 0,
+      finish_reason: [],
+      content_chars: null,
+      serialized_output_chars: null,
+      decision_count: null,
+      reports_represented: null,
+      failure_category: diagnostics.error_name === "TimeoutError" ? "upstream_timeout" : "transport_failure",
+      validation_error: null,
+      error_code: diagnostics.error_code,
+      error_message: diagnostics.error_message,
+      error_last_status: null,
+      error_last_error: null,
+      error_attempts: [],
+      provider_attempts: [],
+      transport: diagnostics
+    };
+  }
+}
+
+function summarizeTokenSweepCeiling(maxTokens, requests) {
+  const latency = requests.map((request) => request.latency_ms).filter(Number.isFinite);
+  const errorCounts = new Map();
+  const providerWins = new Map();
+  for (const request of requests) {
+    if (request.failure_category) errorCounts.set(request.failure_category, (errorCounts.get(request.failure_category) || 0) + 1);
+    if (request.status >= 200 && request.status < 300 && request.provider) {
+      const key = `${request.provider}/${request.routed_model || "unknown"}`;
+      providerWins.set(key, (providerWins.get(key) || 0) + 1);
+    }
+  }
+  return {
+    max_tokens: maxTokens,
+    requests: requests.length,
+    http_success: requests.filter((request) => request.status >= 200 && request.status < 300).length,
+    schema_valid: requests.filter((request) => request.schema_valid).length,
+    terminal_502: requests.filter((request) => request.status === 502).length,
+    terminal_5xx: requests.filter((request) => request.status >= 500 && request.status <= 599).length,
+    transport_failures: requests.filter((request) => request.status === null && request.failure_category === "transport_failure").length,
+    error_counts: Object.fromEntries(errorCounts),
+    provider_wins: Object.fromEntries(providerWins),
+    fallback_attempts: requests.reduce((sum, request) => sum + (request.fallback_attempts || 0), 0),
+    total_prompt_tokens: requests.reduce((sum, request) => sum + (request.prompt_tokens || 0), 0),
+    total_completion_tokens: requests.reduce((sum, request) => sum + (request.completion_tokens || 0), 0),
+    average_prompt_tokens: average(requests.map((request) => request.prompt_tokens).filter((value) => value > 0)),
+    average_completion_tokens: average(requests.map((request) => request.completion_tokens).filter((value) => value > 0)),
+    median_latency_ms: median(latency),
+    p95_latency_ms: percentile(latency, 0.95),
+    maximum_latency_ms: latency.length > 0 ? Math.max(...latency) : null,
+    requests_detail: requests
+  };
+}
+
+function extractFinishReasons(body) {
+  const choices = Array.isArray(body?.choices) ? body.choices : [];
+  return choices.map((choice) => typeof choice?.finish_reason === "string" ? choice.finish_reason : null);
+}
+
+function extractNebulaErrorInfo(body) {
+  const error = body && typeof body.error === "object" && body.error !== null ? body.error : {};
+  const code = firstNonEmpty([error.code, error.error_code]);
+  const message = firstNonEmpty([error.message, error.error_message]);
+  return {
+    error_code: code,
+    error_message: message,
+    error_last_status: error.last_status ?? null,
+    error_last_error: safeDiagnosticValue(error.last_error),
+    error_attempts: Array.isArray(error.attempts) ? error.attempts.map((attempt) => safeDiagnosticValue(attempt)) : []
+  };
+}
+
+function normalizeGatewayAttempts(attempts) {
+  if (!Array.isArray(attempts)) return [];
+  return attempts.map((attempt) => {
+    const value = attempt && typeof attempt === "object" ? attempt : {};
+    const nestedError = value.error && typeof value.error === "object" ? value.error : {};
+    const route = parseRoutedVia(firstNonEmpty([value.routed_via, value.route, value.routedVia]));
+    return {
+      provider: firstNonEmpty([value.provider, value.provider_name]) || route.provider,
+      model: firstNonEmpty([value.model, value.routed_model, value.model_name]) || route.model,
+      status: Number.isFinite(Number(value.status)) ? Number(value.status) : null,
+      error_code: firstNonEmpty([value.error_code, value.code, nestedError.code, nestedError.error_code]),
+      error_message: firstNonEmpty([value.error_message, value.message, nestedError.message, nestedError.error_message])
+    };
+  });
+}
+
+function classifyTokenDiagnosticFailure(status, errorCode, output, schemaValid, validationError) {
+  const code = String(errorCode || "").toLowerCase();
+  if (code.includes("structured_json_invalid") || code.includes("json_invalid")) return "structured_json_invalid";
+  if (code.includes("structured_schema_invalid") || code.includes("schema_invalid")) return "structured_schema_invalid";
+  if (code.includes("timeout") || code.includes("upstream_timeout")) return "upstream_timeout";
+  if (status === 429 || code === "429" || code.includes("rate_limit")) return "429";
+  if (status === 401 || status === 403 || code.includes("auth")) return "auth";
+  if (code.includes("model_unavailable") || code.includes("model-unavailable")) return "model_unavailable";
+  if (code.includes("provider_error") || code.includes("provider-error")) return "provider_error";
+  if (status >= 500 && status <= 599) return "provider_5xx";
+  if (status >= 200 && status < 300 && !output) return "structured_json_invalid";
+  if (status >= 200 && status < 300 && output && !schemaValid) return "structured_schema_invalid";
+  if (validationError) return "structured_schema_invalid";
+  if (status !== 200 && status !== null) return "other";
+  return null;
+}
+
+function describeDiagnosticError(error) {
+  const cause = error && typeof error === "object" && error.cause && typeof error.cause === "object" ? error.cause : null;
+  return {
+    error_name: error?.name || "Error",
+    error_message: redactDiagnosticText(error?.message || String(error)),
+    error_code: error?.code || null,
+    cause_name: cause?.name || null,
+    cause_message: redactDiagnosticText(cause?.message || ""),
+    cause_code: cause?.code || null
+  };
+}
+
+function safeDiagnosticValue(value) {
+  if (value === null || value === undefined) return null;
+  if (typeof value === "string") return redactDiagnosticText(value).slice(0, 4_000);
+  if (typeof value === "number" || typeof value === "boolean") return value;
+  if (Array.isArray(value)) return value.slice(0, 64).map(safeDiagnosticValue);
+  if (typeof value === "object") {
+    return Object.fromEntries(Object.entries(value).slice(0, 64).map(([key, item]) => [key, safeDiagnosticValue(item)]));
+  }
+  return String(value);
+}
+
+function safeDiagnosticJson(body, bodyText) {
+  const value = body !== null && body !== undefined ? JSON.stringify(safeDiagnosticValue(body)) : bodyText;
+  return redactDiagnosticText(value || "").slice(0, 20_000);
+}
+
+function redactDiagnosticText(value) {
+  let text = String(value || "");
+  if (API_KEY) text = text.split(API_KEY).join("[REDACTED]");
+  return text.replace(/Bearer\s+[^\s"']+/giu, "Bearer [REDACTED]");
+}
+
 async function runHighDensityExperiment(rows, events, cap) {
   const chronological = [...rows].sort((left, right) => String(left.published_at || left.observed_at).localeCompare(String(right.published_at || right.observed_at)) || left.id - right.id);
   const groups = [];
@@ -916,10 +1320,16 @@ async function callNebula(batchReports, events, pass, options = {}) {
 
 async function fetchNebulaResponse(url, init) {
   const controller = new AbortController();
-  const request = fetch(url, { ...init, signal: controller.signal }).then(async (response) => ({
-    response,
-    body: await response.json().catch(() => null)
-  }));
+  const request = fetch(url, { ...init, signal: controller.signal }).then(async (response) => {
+    const bodyText = await response.text();
+    let body = null;
+    try {
+      body = JSON.parse(bodyText);
+    } catch {
+      body = null;
+    }
+    return { response, body, body_text: bodyText.slice(0, 2_000_000) };
+  });
   let timeoutId;
   const timeout = new Promise((_, reject) => {
     timeoutId = setTimeout(() => {
