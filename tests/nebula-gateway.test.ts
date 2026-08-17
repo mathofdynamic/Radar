@@ -22,7 +22,7 @@ function fakeEnv(): Env {
     DB: db,
     NEBULA_API_KEY: "test-key",
     NEBULA_BASE_URL: "https://nebula.example/v1",
-    NEBULA_INTELLIGENCE_MODEL: "radar-fast",
+    NEBULA_INTELLIGENCE_MODEL: "@cf/zai-org/glm-4.7-flash",
     NEBULA_EDITORIAL_MODEL: "auto",
     NEBULA_MODEL: "auto",
     NEBULA_INTELLIGENCE_TIMEOUT_MS: "95000",
@@ -49,9 +49,9 @@ const validOutput = {
 };
 
 describe("Nebula gateway", () => {
-  it("uses radar-fast, strict JSON Schema, and captures routing headers for intelligence", async () => {
+  it("uses the GLM intelligence default, strict JSON Schema, and captures routing headers", async () => {
     const fetchMock = vi.spyOn(globalThis, "fetch").mockResolvedValue(new Response(JSON.stringify({
-      model: "radar-fast",
+      model: "@cf/zai-org/glm-4.7-flash",
       usage: { prompt_tokens: 12, completion_tokens: 8 },
       choices: [{ message: { content: JSON.stringify(validOutput) } }]
     }), {
@@ -67,7 +67,7 @@ describe("Nebula gateway", () => {
       const result = await generateNebulaJson(fakeEnv(), "intelligence", "system", "user", intelligenceBatchOutputSchema);
       expect(result?.data).toEqual(validOutput);
       expect(result?.usage.promptTokens).toBe(12);
-      expect(result?.usage.requestedModel).toBe("radar-fast");
+      expect(result?.usage.requestedModel).toBe("@cf/zai-org/glm-4.7-flash");
       expect(result?.usage.provider).toBe("cloudflare");
       expect(result?.usage.routedModel).toBe("@cf/meta/llama-3.1-8b-instruct-fast");
       expect(result?.usage.fallbackAttempts).toBe(2);
@@ -76,14 +76,14 @@ describe("Nebula gateway", () => {
       expect(result?.usage.latencyMs).toBeGreaterThanOrEqual(0);
       const request = fetchMock.mock.calls[0]?.[1] as RequestInit;
       const body = JSON.parse(String(request.body)) as { model: string; response_format: { type: string; json_schema: { name: string; strict: boolean; schema: typeof intelligenceBatchJsonSchema } } };
-      expect(body.model).toBe("radar-fast");
+      expect(body.model).toBe("@cf/zai-org/glm-4.7-flash");
       expect(body.response_format.type).toBe("json_schema");
       expect(body.response_format.json_schema.name).toBe("radar_intelligence_batch");
       expect(body.response_format.json_schema.strict).toBe(true);
       expect(body.response_format.json_schema.schema).toEqual(intelligenceBatchJsonSchema);
       expect(fetchMock).toHaveBeenCalledWith("https://nebula.example/v1/chat/completions", expect.objectContaining({
         method: "POST",
-        body: expect.stringContaining('"model":"radar-fast"')
+        body: expect.stringContaining('"model":"@cf/zai-org/glm-4.7-flash"')
       }));
     } finally {
       fetchMock.mockRestore();

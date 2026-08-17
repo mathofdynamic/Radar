@@ -13,6 +13,7 @@
     "lint": "tsc --noEmit",
     "backtest": "node scripts/v8-backtest.mjs",
     "backtest:manifest": "node scripts/v8-create-manifest.mjs",
+    "benchmark:glm-gemma": "node scripts/v8-glm-gemma-benchmark.mjs",
     "typecheck": "tsc --noEmit",
     "test": "vitest run",
     "test:watch": "vitest",

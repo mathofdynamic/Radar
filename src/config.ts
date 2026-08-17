@@ -44,7 +44,7 @@ export function runtimeConfig(env: Env): RuntimeConfig {
     pollIntervalSeconds: Math.max(60, numberSetting(env.POLL_INTERVAL_SECONDS, 300)),
     maxHtmlBytes: Math.max(64_000, numberSetting(env.MAX_HTML_BYTES, 524_288)),
     nebulaBaseUrl: (env.NEBULA_BASE_URL || "https://nebula-free-llm.nebula-ai-company.workers.dev/v1").replace(/\/+$/u, ""),
-    nebulaIntelligenceModel: env.NEBULA_INTELLIGENCE_MODEL || "radar-fast",
+    nebulaIntelligenceModel: env.NEBULA_INTELLIGENCE_MODEL || "@cf/zai-org/glm-4.7-flash",
     nebulaEditorialModel: env.NEBULA_EDITORIAL_MODEL || legacyModel,
     nebulaIntelligenceTimeoutMs: Math.max(5_000, Math.min(95_000, numberSetting(env.NEBULA_INTELLIGENCE_TIMEOUT_MS, 95_000))),
     nebulaEditorialTimeoutMs: Math.max(5_000, Math.min(55_000, numberSetting(env.NEBULA_EDITORIAL_TIMEOUT_MS, legacyTimeout))),
