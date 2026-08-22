@@ -1,4 +1,4 @@
-import { runtimeConfig } from "../config";
+import { assertCurrentWindowConfiguration, runtimeConfig, V8_CURRENT_WINDOW_MODEL } from "../config";
 import { sha256Hex } from "../crypto";
 import {
   claimIntelligenceReport,
@@ -12,12 +12,22 @@ import { normalizePersianText, lexicalOverlap } from "../normalization";
 import type { EditorialBatchJob, IntelligenceBatchJob } from "../queue";
 import { generateNebulaJson, NebulaError, type NebulaJsonResult, type NebulaUsage } from "./ai";
 import { ANALYSIS_STALE_AFTER_MS, floorFiveMinuteWindow, normalizeLegacyAnalysisStatus } from "./analysis-state";
+import { validateIntelligenceDecisions } from "./decision";
 import {
-  ambiguousPostIds,
-  isCorrectableIntelligenceValidationError,
-  replaceAmbiguousDecisions,
-  validateIntelligenceDecisions
-} from "./decision";
+  acceptsCurrentWindowPair,
+  currentWindowPairJsonSchema,
+  currentWindowPairOutputSchema,
+  currentWindowProposalJsonSchema,
+  currentWindowProposalOutputSchema,
+  reconstructCurrentWindowClusters,
+  validateCurrentWindowPair,
+  validateCurrentWindowProposal,
+  CurrentWindowValidationError,
+  type CurrentWindowPair,
+  type CurrentWindowPairCheck,
+  type CurrentWindowProposal,
+  type ReconstructedCurrentWindowCluster
+} from "./current-window";
 import { extractEntityKeys, inferCategory } from "./similarity";
 import { calculateVerification, classifyOrigin, originGroupFor, persistVerification } from "./verification";
 import { scoreEvent } from "../editorial/scoring";
@@ -41,15 +51,15 @@ interface BatchReportRow extends RawPostRow {
   source_key: string;
 }
 
-interface ActiveEventSummary {
-  event_id: number;
-  core_fact: string;
-  category: string;
-  first_seen_at: string;
-  last_updated_at: string;
-  source_names: string;
-  source_count: number;
-  independent_confirmation_count: number;
+export interface CurrentWindowReportInput {
+  id: number;
+  source_id: number;
+  source_name: string;
+  source_key: string;
+  published_at: string | null;
+  observed_at: string;
+  original_text: string;
+  normalized_text: string;
 }
 
 interface BatchApplyResult {
@@ -60,31 +70,65 @@ interface BatchApplyResult {
   uncertain: number;
 }
 
-interface DecisionRequestOptions {
-  kind?: "primary" | "second_pass" | "correction";
-  expectedPostIds?: readonly number[];
-  duplicateTargetPostIds?: readonly number[];
-  priorDecisions?: IntelligenceDecision[];
-  correctionError?: string;
+interface CurrentProposalRequestResult extends NebulaJsonResult<CurrentWindowProposal> {}
+
+interface CurrentPairRequestResult extends NebulaJsonResult<CurrentWindowPair> {}
+
+export interface CurrentWindowTelemetry {
+  reports_considered: number;
+  reports_sent_to_proposal: number;
+  proposal_clusters: number;
+  proposal_singletons: number;
+  proposal_retries: number;
+  pair_verification_calls: number;
+  pair_verification_retries: number;
+  pair_verification_failures: number;
+  accepted_same_event_edges: number;
+  rejected_edges: number;
+  final_multi_report_clusters: number;
+  final_singletons: number;
+  proposal_latency_ms: number;
+  ai_latency_ms: number;
+  request_latencies_ms: number[];
+  prompt_tokens: number;
+  completion_tokens: number;
+  physical_attempts: number;
+  http_200: number;
+  http_429: number;
+  http_502: number;
+  http_503: number;
+  http_504: number;
+  other_5xx: number;
+  transport_failures: number;
+  retry_recoveries: number;
+  contract_failures: number;
+  model_failures: number;
+  historical_semantic_links_attempted: 0;
 }
 
-interface DecisionRequestResult extends NebulaJsonResult<{ decisions: IntelligenceDecision[] }> {
-  suppliedEventIds: number[];
+export interface CurrentWindowShadowResult {
+  proposal: CurrentWindowProposal;
+  pairChecks: CurrentWindowPairCheck[];
+  finalClusters: ReconstructedCurrentWindowCluster[];
+  telemetry: CurrentWindowTelemetry;
 }
 
-interface CorrectionState {
-  used: boolean;
-}
+const CURRENT_WINDOW_PROPOSAL_SYSTEM_PROMPT = `You are Radar's current-window event clustering layer.
+Group only reports supplied in this request when they describe the same concrete real-world occurrence.
+This request contains no historical events. Do not perform historical event matching.
+Do not merge reports merely because they share a person, organization, country, city, conflict, sport, topic, or category.
+Different wording, language, source, detail level, or slight publication-time differences can still describe one occurrence.
+First identify clusters, then classify each cluster as EVENT, NOISE, or UNCERTAIN.
+Every supplied post_id must occur exactly once. Return JSON only and never invent IDs or facts.`;
 
-const INTELLIGENCE_SYSTEM_PROMPT = `You are Radar's Persian-news event intelligence layer.
-Several reports may describe the same real-world event with very different wording.
-Reason about meaning, not wording. Persian and English reports can describe the same event.
-Distinguish different events involving the same person, organization, or place.
-Do not merge reports merely because an entity matches. Respect timestamps and supplied evidence.
-Never invent facts, post IDs, event IDs, source names, confirmation counts, or relationships.
-Use only supplied post_ids and event_id values. Confidence must reflect uncertainty.
-Radar, not you, calculates independent source confirmations and verification status.
-Return exactly one JSON object with a decisions array and no Markdown.`;
+const CURRENT_WINDOW_PAIR_SYSTEM_PROMPT = `You are Radar's conservative current-window pair verifier.
+Determine whether exactly these two supplied reports describe the SAME concrete real-world occurrence.
+SAME_EVENT requires the same specific occurrence, announcement, incident, decision, attack, accident, restriction, forecast, publication, match, transaction, or other concrete event.
+Shared people, organizations, countries, cities, conflicts, companies, sports, political themes, categories, or keywords are insufficient.
+When uncertain, return UNCERTAIN. False SAME_EVENT is more harmful than false DIFFERENT_EVENT.
+Return JSON only with relationship and confidence.`;
+
+const CURRENT_WINDOW_CHAT_TEMPLATE_KWARGS = { enable_thinking: false };
 
 export async function ingestEnvelope(env: Env, envelope: TelegramWebPollEnvelope, options: IngestOptions = {}): Promise<number> {
   const source = await getSource(env.DB, envelope.sourceId);
@@ -221,8 +265,9 @@ export async function processIntelligenceBatch(env: Env, job: IntelligenceBatchJ
 
   const config = runtimeConfig(env);
   const reports = await claimBatchReports(env.DB, batch.id, config);
+  const telemetry = createCurrentWindowTelemetry(reports.length);
   if (reports.length === 0) {
-    await completeBatch(env.DB, batch.id, null, 0, 0);
+    await completeBatch(env.DB, batch.id, summarizeCurrentWindowTelemetry(telemetry), 0, 0);
     await enqueueIntelligenceBatch(env, new Date().toISOString(), true);
     return;
   }
@@ -230,75 +275,17 @@ export async function processIntelligenceBatch(env: Env, job: IntelligenceBatchJ
     .bind(reports.length, new Date().toISOString(), batch.id).run();
 
   try {
-    const activeEvents = await listActiveEvents(env.DB, config.intelligenceMaxActiveEvents);
-    const primary = await requestBatchDecisions(env, reports, activeEvents, "intelligence");
-    if (!primary) throw new NebulaError("intelligence_primary_unavailable");
-    const correctionState: CorrectionState = { used: false };
     const allReportIds = reports.map((report) => report.id);
-    const primaryValidation = await validateDecisionSetWithCorrection(
-      env,
-      reports,
-      activeEvents,
-      "intelligence",
-      primary.data,
-      allReportIds,
-      new Set(primary.suppliedEventIds),
-      new Set(allReportIds),
-      correctionState
-    );
-    let decisions = primaryValidation.decisions;
-    const uncertainIds = ambiguousPostIds(decisions, config.intelligenceAmbiguityThreshold);
-    const nebulaUsages: NebulaUsage[] = [primary.usage, ...(primaryValidation.correctionUsage ? [primaryValidation.correctionUsage] : [])];
-    let promptTokens = nebulaUsages.reduce((sum, usage) => sum + usage.promptTokens, 0);
-    let completionTokens = nebulaUsages.reduce((sum, usage) => sum + usage.completionTokens, 0);
-
-    if (uncertainIds.length > 0) {
-      const focusedEvents = activeEvents.filter((event) => decisions.some((decision) => decision.event_id === event.event_id && uncertainIds.some((id) => decision.post_ids.includes(id)))).slice(0, 5);
-      const focusedReports = reports.filter((report) => uncertainIds.includes(report.id));
-      const second = await requestBatchDecisions(env, focusedReports, focusedEvents, "intelligence_second_pass", {
-        kind: "second_pass",
-        expectedPostIds: uncertainIds,
-        duplicateTargetPostIds: allReportIds,
-        priorDecisions: decisions.filter((decision) => decision.post_ids.some((id) => uncertainIds.includes(id)))
-      });
-      if (!second) throw new NebulaError("intelligence_second_pass_unavailable");
-      const secondValidation = await validateDecisionSetWithCorrection(
-        env,
-        focusedReports,
-        focusedEvents,
-        "intelligence_second_pass",
-        second.data,
-        uncertainIds,
-        new Set(second.suppliedEventIds),
-        new Set(allReportIds),
-        correctionState
-      );
-      decisions = replaceAmbiguousDecisions(decisions, secondValidation.decisions, new Set(uncertainIds));
-      nebulaUsages.push(second.usage);
-      if (secondValidation.correctionUsage) nebulaUsages.push(secondValidation.correctionUsage);
-      promptTokens = nebulaUsages.reduce((sum, usage) => sum + usage.promptTokens, 0);
-      completionTokens = nebulaUsages.reduce((sum, usage) => sum + usage.completionTokens, 0);
-    }
-
-    const finalValidation = await validateDecisionSetWithCorrection(
-      env,
-      reports,
-      activeEvents,
-      "intelligence",
+    const shadow = await runCurrentWindowShadow(env, reports, telemetry);
+    const decisions = buildCurrentWindowDecisions(shadow.finalClusters, reports);
+    const validatedDecisions = validateIntelligenceDecisions(
       { decisions },
       allReportIds,
-      new Set(activeEvents.map((event) => event.event_id)),
-      new Set(allReportIds),
-      correctionState
+      new Set(),
+      new Set(allReportIds)
     );
-    decisions = finalValidation.decisions;
-    if (finalValidation.correctionUsage) {
-      nebulaUsages.push(finalValidation.correctionUsage);
-      promptTokens += finalValidation.correctionUsage.promptTokens;
-      completionTokens += finalValidation.correctionUsage.completionTokens;
-    }
-    const outcome = await applyBatchDecisions(env, batch.id, reports, decisions);
-    await completeBatch(env.DB, batch.id, summarizeNebulaUsage(nebulaUsages), promptTokens, completionTokens);
+    const outcome = await applyBatchDecisions(env, batch.id, reports, validatedDecisions);
+    await completeBatch(env.DB, batch.id, summarizeCurrentWindowTelemetry(telemetry), telemetry.prompt_tokens, telemetry.completion_tokens);
     await safeIncrementCounter(env.DB, "intelligence_batches");
     await safeIncrementCounter(env.DB, "intelligence_reports_processed", reports.length);
     if (outcome.newEvents > 0) await safeIncrementCounter(env.DB, "intelligence_new_events", outcome.newEvents);
@@ -306,37 +293,123 @@ export async function processIntelligenceBatch(env: Env, job: IntelligenceBatchJ
     if (outcome.duplicates > 0) await safeIncrementCounter(env.DB, "intelligence_duplicates", outcome.duplicates);
     if (outcome.uncertain > 0) await safeIncrementCounter(env.DB, "intelligence_uncertain", outcome.uncertain);
   } catch (error) {
+    if (error instanceof CurrentWindowValidationError || (error instanceof NebulaError && (error.message.includes("schema") || error.message.includes("response_not_json")))) telemetry.contract_failures += 1;
+    else if (error instanceof NebulaError && error.message !== "historical_semantic_linking_unsupported") telemetry.model_failures += 1;
+    if (error instanceof NebulaError && error.message === "historical_semantic_linking_unsupported") {
+      console.error(JSON.stringify({ event: "v8_historical_semantic_linking_unsupported", historical_semantic_links_attempted: 0 }));
+    }
+    await persistCurrentWindowTelemetry(env.DB, batch.id, telemetry);
     await releaseBatchReports(env.DB, batch.id, error instanceof Error ? error.message : "intelligence_batch_failed");
     throw error;
   }
   await enqueueIntelligenceBatch(env, new Date().toISOString(), true);
 }
 
-async function requestBatchDecisions(
+export async function runCurrentWindowShadow(
   env: Env,
-  reports: BatchReportRow[],
-  activeEvents: ActiveEventSummary[],
-  stage: "intelligence" | "intelligence_second_pass",
-  options: DecisionRequestOptions = {}
-): Promise<DecisionRequestResult | null> {
+  reports: readonly CurrentWindowReportInput[],
+  telemetry = createCurrentWindowTelemetry(reports.length)
+): Promise<CurrentWindowShadowResult> {
   const config = runtimeConfig(env);
-  const expectedPostIds = [...(options.expectedPostIds ?? reports.map((report) => report.id))];
-  const duplicateTargetPostIds = [...(options.duplicateTargetPostIds ?? reports.map((report) => report.id))];
-  const promptBase = {
-    task: "Classify every supplied report exactly once. Group reports that describe the same real-world event.",
-    output_rules: {
-      actions: ["MATCH_EXISTING_EVENT", "NEW_EVENT", "DUPLICATE", "UPDATE_EXISTING_EVENT", "NOISE", "UNCERTAIN"],
-      event_id: "Use only an active event_id supplied below; use null for NEW_EVENT, DUPLICATE, NOISE, or UNCERTAIN.",
-      duplicate_of_post_id: "For DUPLICATE, use one supplied post_id as the canonical report.",
-      independent_confirmations: "Never return or calculate this field. Radar computes it from origin groups.",
-      coverage: "Every report id must appear in exactly one decision. Do not omit or repeat ids."
-    },
-    prior_decisions: options.priorDecisions && options.priorDecisions.length > 0 ? options.priorDecisions : undefined,
-    correction: options.kind === "correction" ? {
-      validation_error: options.correctionError,
-      instruction: "Correct only the deterministic decision-graph error. Use only supplied report and event IDs. Do not invent facts, IDs, or relationships."
-    } : undefined,
-    reports: reports.map((report) => ({
+  try {
+    assertCurrentWindowConfiguration(config);
+  } catch (error) {
+    throw new NebulaError(error instanceof Error ? error.message : "v8_current_window_configuration_invalid");
+  }
+
+  let proposalResult: CurrentProposalRequestResult | null;
+  try {
+    proposalResult = await requestCurrentWindowProposal(env, reports);
+    if (!proposalResult) throw new NebulaError("v8_current_window_proposal_unavailable");
+    recordNebulaUsage(telemetry, proposalResult.usage, false);
+    telemetry.proposal_latency_ms += proposalResult.usage.latencyMs;
+    proposalResult = { ...proposalResult, data: validateCurrentWindowProposal(proposalResult.data, reports.map((report) => report.id)) };
+  } catch (error) {
+    recordNebulaFailureTelemetry(telemetry, error, false);
+    throw error;
+  }
+  if (!proposalResult) throw new NebulaError("v8_current_window_proposal_unavailable");
+  telemetry.proposal_clusters = proposalResult.data.clusters.length;
+  telemetry.proposal_singletons = proposalResult.data.clusters.filter((cluster) => cluster.post_ids.length === 1).length;
+
+  const pairChecks: CurrentWindowPairCheck[] = [];
+  for (const cluster of proposalResult.data.clusters) {
+    if (cluster.classification !== "EVENT" || cluster.post_ids.length < 2) continue;
+    for (const [leftPostId, rightPostId] of allPairs(cluster.post_ids)) {
+      telemetry.pair_verification_calls += 1;
+      const pairResult = await requestCurrentWindowPair(env, reports, leftPostId, rightPostId, telemetry);
+      pairChecks.push({ leftPostId, rightPostId, result: pairResult?.data ?? null });
+      if (pairResult?.data && acceptsCurrentWindowPair(pairResult.data)) telemetry.accepted_same_event_edges += 1;
+      else telemetry.rejected_edges += 1;
+    }
+  }
+
+  const finalClusters = reconstructCurrentWindowClusters(proposalResult.data, pairChecks);
+  telemetry.final_multi_report_clusters = finalClusters.filter((cluster) => cluster.postIds.length > 1).length;
+  telemetry.final_singletons = finalClusters.filter((cluster) => cluster.postIds.length === 1).length;
+  return { proposal: proposalResult.data, pairChecks, finalClusters, telemetry };
+}
+
+async function requestCurrentWindowProposal(env: Env, reports: readonly CurrentWindowReportInput[]): Promise<CurrentProposalRequestResult | null> {
+  const config = runtimeConfig(env);
+  const reportPayload = reports.map((report) => ({
+    post_id: report.id,
+    source_id: report.source_id,
+    source_name: report.source_name,
+    published_at: report.published_at,
+    observed_at: report.observed_at,
+    text: (report.normalized_text || report.original_text).slice(0, config.intelligenceMaxReportChars)
+  }));
+  const prompt = JSON.stringify({
+    task: "Cluster every supplied current report exactly once.",
+    reports: reportPayload,
+    rules: [
+      "Group reports only when they describe the same concrete current occurrence.",
+      "Do not group reports merely because they share a topic, person, country, organization, category, or geopolitical theme.",
+      "First identify clusters, then assign one classification per cluster.",
+      "Use EVENT for a concrete event, NOISE for deterministic noise, and UNCERTAIN when safe grouping is not established.",
+      "Every supplied post_id must occur exactly once.",
+      "No historical events or historical IDs are provided or allowed."
+    ],
+    output_schema: { clusters: "[{post_ids, classification, confidence}]" }
+  });
+  if (prompt.length + CURRENT_WINDOW_PROPOSAL_SYSTEM_PROMPT.length > config.intelligenceMaxPayloadChars) throw new NebulaError("v8_current_window_payload_too_large");
+  const result = await generateNebulaJson(
+    env,
+    "intelligence_proposal",
+    CURRENT_WINDOW_PROPOSAL_SYSTEM_PROMPT,
+    prompt,
+    currentWindowProposalOutputSchema,
+    2_000,
+    {
+      responseSchema: currentWindowProposalJsonSchema(reports.map((report) => report.id)),
+      responseSchemaName: "radar_current_window_clusters",
+      chatTemplateKwargs: CURRENT_WINDOW_CHAT_TEMPLATE_KWARGS,
+      completionParameter: "max_completion_tokens"
+    }
+  );
+  return result;
+}
+
+async function requestCurrentWindowPair(
+  env: Env,
+  reports: readonly CurrentWindowReportInput[],
+  leftPostId: number,
+  rightPostId: number,
+  telemetry: CurrentWindowTelemetry
+): Promise<CurrentPairRequestResult | null> {
+  const config = runtimeConfig(env);
+  const reportById = new Map(reports.map((report) => [report.id, report]));
+  const left = reportById.get(leftPostId);
+  const right = reportById.get(rightPostId);
+  if (!left || !right) {
+    telemetry.pair_verification_failures += 1;
+    telemetry.rejected_edges += 1;
+    return null;
+  }
+  const prompt = JSON.stringify({
+    task: "Verify exactly this proposed pair and no other reports.",
+    reports: [left, right].map((report) => ({
       post_id: report.id,
       source_id: report.source_id,
       source_name: report.source_name,
@@ -344,86 +417,169 @@ async function requestBatchDecisions(
       observed_at: report.observed_at,
       text: (report.normalized_text || report.original_text).slice(0, config.intelligenceMaxReportChars)
     })),
-  };
-  const eventPayload = activeEvents.slice(0, config.intelligenceMaxActiveEvents).map((event) => ({
-    event_id: event.event_id,
-    core_fact: event.core_fact.slice(0, 600),
-    category: event.category,
-    first_seen_at: event.first_seen_at,
-    last_updated_at: event.last_updated_at,
-    source_names: event.source_names.slice(0, 300),
-    source_count: event.source_count,
-    existing_confirmation_count_is_context_only: event.independent_confirmation_count
-  }));
-  let eventLimit = eventPayload.length;
-  let prompt = JSON.stringify({ ...promptBase, active_events: eventPayload.slice(0, eventLimit) });
-  while (prompt.length + INTELLIGENCE_SYSTEM_PROMPT.length > config.intelligenceMaxPayloadChars && eventLimit > 5) {
-    eventLimit = Math.max(5, Math.floor(eventLimit / 2));
-    prompt = JSON.stringify({ ...promptBase, active_events: eventPayload.slice(0, eventLimit) });
-  }
-  if (prompt.length + INTELLIGENCE_SYSTEM_PROMPT.length > config.intelligenceMaxPayloadChars) throw new NebulaError("intelligence_payload_too_large");
-  const suppliedEventIds = eventPayload.slice(0, eventLimit).map((event) => event.event_id);
-  const result = await generateNebulaJson(
-    env,
-    stage,
-    INTELLIGENCE_SYSTEM_PROMPT,
-    prompt,
-    intelligenceBatchOutputSchema,
-    2_000,
-    { responseSchema: scopeIntelligenceBatchJsonSchema(expectedPostIds, suppliedEventIds, duplicateTargetPostIds) }
-  );
-  if (!result) return null;
-  return {
-    ...result,
-    suppliedEventIds,
-    data: {
-      decisions: result.data.decisions.map((decision) => ({
-        ...decision,
-        duplicate_of_post_id: decision.duplicate_of_post_id ?? null
-      }))
-    }
-  };
-}
-
-async function validateDecisionSetWithCorrection(
-  env: Env,
-  reports: BatchReportRow[],
-  activeEvents: ActiveEventSummary[],
-  stage: "intelligence" | "intelligence_second_pass",
-  value: unknown,
-  expectedPostIds: number[],
-  knownEventIds: ReadonlySet<number>,
-  allowedPostIds: ReadonlySet<number>,
-  correctionState: CorrectionState
-): Promise<{ decisions: IntelligenceDecision[]; correctionUsage?: NebulaUsage }> {
+    rules: [
+      "Return SAME_EVENT only for the same concrete real-world occurrence.",
+      "Shared topics, entities, organizations, places, or categories are insufficient.",
+      "Return DIFFERENT_EVENT for distinct occurrences and UNCERTAIN when evidence is insufficient.",
+      "Return exactly relationship and confidence."
+    ]
+  });
   try {
-    return { decisions: validateIntelligenceDecisions(value, expectedPostIds, knownEventIds, allowedPostIds) };
-  } catch (error) {
-    if (!isCorrectableIntelligenceValidationError(error) || correctionState.used) throw error;
-    correctionState.used = true;
-    await safeIncrementCounter(env.DB, "nebula_contract_correction_calls");
-    let correction: DecisionRequestResult | null = null;
-    try {
-      correction = await requestBatchDecisions(env, reports, activeEvents, stage, {
-        kind: "correction",
-        expectedPostIds,
-        duplicateTargetPostIds: [...allowedPostIds],
-        priorDecisions: isDecisionOutput(value) ? value.decisions : [],
-        correctionError: error.message
-      });
-      if (!correction) throw new NebulaError("intelligence_contract_correction_unavailable");
-      const decisions = validateIntelligenceDecisions(correction.data, expectedPostIds, knownEventIds, allowedPostIds);
-      await safeIncrementCounter(env.DB, "nebula_contract_correction_successes");
-      return { decisions, correctionUsage: correction.usage };
-    } catch (correctionError) {
-      await safeIncrementCounter(env.DB, "nebula_contract_correction_failures");
-      throw correctionError;
+    const result = await generateNebulaJson(
+      env,
+      "intelligence_pair",
+      CURRENT_WINDOW_PAIR_SYSTEM_PROMPT,
+      prompt,
+      currentWindowPairOutputSchema,
+      150,
+      {
+        responseSchema: currentWindowPairJsonSchema,
+        responseSchemaName: "radar_current_window_pair",
+        chatTemplateKwargs: CURRENT_WINDOW_CHAT_TEMPLATE_KWARGS,
+        completionParameter: "max_completion_tokens"
+      }
+    );
+    if (!result) {
+      telemetry.pair_verification_failures += 1;
+      telemetry.model_failures += 1;
+      return null;
     }
+    recordNebulaUsage(telemetry, result.usage, true);
+    return { ...result, data: validateCurrentWindowPair(result.data) };
+  } catch (error) {
+    telemetry.pair_verification_failures += 1;
+    recordNebulaFailureTelemetry(telemetry, error, true);
+    if (error instanceof CurrentWindowValidationError || (error instanceof NebulaError && (error.message.includes("schema") || error.message.includes("response_not_json")))) telemetry.contract_failures += 1;
+    else telemetry.model_failures += 1;
+    console.warn(JSON.stringify({
+      event: "v8_current_window_pair_failed_closed",
+      left_post_id: leftPostId,
+      right_post_id: rightPostId,
+      error: error instanceof Error ? error.message.slice(0, 240) : "unknown",
+      historical_semantic_links_attempted: 0
+    }));
+    return null;
   }
 }
 
-function isDecisionOutput(value: unknown): value is { decisions: IntelligenceDecision[] } {
-  return typeof value === "object" && value !== null && "decisions" in value && Array.isArray(value.decisions);
+function allPairs(postIds: readonly number[]): Array<[number, number]> {
+  const pairs: Array<[number, number]> = [];
+  for (let left = 0; left < postIds.length; left += 1) {
+    for (let right = left + 1; right < postIds.length; right += 1) pairs.push([postIds[left], postIds[right]]);
+  }
+  return pairs;
+}
+
+function buildCurrentWindowDecisions(clusters: readonly ReconstructedCurrentWindowCluster[], reports: readonly BatchReportRow[]): IntelligenceDecision[] {
+  const reportById = new Map(reports.map((report) => [report.id, report]));
+  return clusters.map((cluster) => {
+    const firstReport = reportById.get(cluster.postIds[0]);
+    const text = firstReport?.normalized_text || firstReport?.original_text || "Current-window report";
+    const category = inferCategory(text) as IntelligenceDecision["category"];
+    const action: IntelligenceDecision["action"] = cluster.classification === "NOISE"
+      ? "NOISE"
+      : cluster.classification === "UNCERTAIN" ? "UNCERTAIN" : "NEW_EVENT";
+    return {
+      post_ids: cluster.postIds,
+      action,
+      event_id: null,
+      duplicate_of_post_id: null,
+      confidence: cluster.confidence,
+      canonical_fact: text.slice(0, 800) || "Current-window event",
+      category,
+      reason: cluster.classification === "EVENT"
+        ? `v8_current_window_anchor_cluster:${cluster.anchorPostId ?? "singleton"}`
+        : `v8_current_window_${cluster.classification.toLowerCase()}`
+    };
+  });
+}
+
+function createCurrentWindowTelemetry(reportsConsidered: number): CurrentWindowTelemetry {
+  return {
+    reports_considered: reportsConsidered,
+    reports_sent_to_proposal: reportsConsidered,
+    proposal_clusters: 0,
+    proposal_singletons: 0,
+    proposal_retries: 0,
+    pair_verification_calls: 0,
+    pair_verification_retries: 0,
+    pair_verification_failures: 0,
+    accepted_same_event_edges: 0,
+    rejected_edges: 0,
+    final_multi_report_clusters: 0,
+    final_singletons: 0,
+    proposal_latency_ms: 0,
+    ai_latency_ms: 0,
+    request_latencies_ms: [],
+    prompt_tokens: 0,
+    completion_tokens: 0,
+    physical_attempts: 0,
+    http_200: 0,
+    http_429: 0,
+    http_502: 0,
+    http_503: 0,
+    http_504: 0,
+    other_5xx: 0,
+    transport_failures: 0,
+    retry_recoveries: 0,
+    contract_failures: 0,
+    model_failures: 0,
+    historical_semantic_links_attempted: 0
+  };
+}
+
+function recordNebulaUsage(telemetry: CurrentWindowTelemetry, usage: NebulaUsage, isPairVerification: boolean): void {
+  telemetry.ai_latency_ms += usage.latencyMs;
+  telemetry.request_latencies_ms.push(usage.latencyMs);
+  telemetry.prompt_tokens += usage.promptTokens;
+  telemetry.completion_tokens += usage.completionTokens;
+  recordNebulaStatuses(telemetry, usage.attemptStatuses);
+  if (usage.logicalRetry) {
+    if (isPairVerification) telemetry.pair_verification_retries += 1;
+    else telemetry.proposal_retries += 1;
+    telemetry.retry_recoveries += 1;
+  }
+}
+
+function recordNebulaFailureTelemetry(telemetry: CurrentWindowTelemetry, error: unknown, isPairVerification: boolean): void {
+  if (!(error instanceof NebulaError) || !error.telemetry) return;
+  telemetry.ai_latency_ms += error.telemetry.latencyMs;
+  telemetry.request_latencies_ms.push(error.telemetry.latencyMs);
+  recordNebulaStatuses(telemetry, error.telemetry.attemptStatuses);
+  const retries = Math.max(0, error.telemetry.logicalAttempt - 1);
+  if (isPairVerification) telemetry.pair_verification_retries += retries;
+  else telemetry.proposal_retries += retries;
+}
+
+function recordNebulaStatuses(telemetry: CurrentWindowTelemetry, statuses: readonly (number | null)[]): void {
+  telemetry.physical_attempts += statuses.length > 0 ? statuses.length : 1;
+  for (const status of statuses) {
+    if (status === 200) telemetry.http_200 += 1;
+    else if (status === 429) telemetry.http_429 += 1;
+    else if (status === 502) telemetry.http_502 += 1;
+    else if (status === 503) telemetry.http_503 += 1;
+    else if (status === 504) telemetry.http_504 += 1;
+    else if (status !== null && status >= 500 && status < 600) telemetry.other_5xx += 1;
+    else if (status === null) telemetry.transport_failures += 1;
+  }
+}
+
+function summarizeCurrentWindowTelemetry(telemetry: CurrentWindowTelemetry): string {
+  return JSON.stringify({
+    v8_current_window: telemetry,
+    model: V8_CURRENT_WINDOW_MODEL,
+    thinking: "disabled",
+    historical_semantic_linking: "disabled"
+  });
+}
+
+async function persistCurrentWindowTelemetry(db: D1Database, batchId: number, telemetry: CurrentWindowTelemetry): Promise<void> {
+  try {
+    await db.prepare("UPDATE intelligence_batches SET provider_used = ?, prompt_tokens = ?, completion_tokens = ?, updated_at = ? WHERE id = ?")
+      .bind(summarizeCurrentWindowTelemetry(telemetry), telemetry.prompt_tokens, telemetry.completion_tokens, new Date().toISOString(), batchId).run();
+  } catch (error) {
+    console.warn(JSON.stringify({ event: "v8_current_window_telemetry_persist_failed", error: error instanceof Error ? error.message : "unknown" }));
+  }
 }
 
 async function claimBatch(db: D1Database, batchId: number): Promise<boolean> {
@@ -456,7 +612,7 @@ async function claimBatchReports(db: D1Database, batchId: number, config: Return
                COALESCE(rp.created_at, rp.observed_at) ASC, rp.id ASC
       LIMIT ?`
   ).bind(freshBefore, Math.max(config.intelligenceMaxReportsPerBatch * 4, 40)).all<BatchReportRow>();
-  const reportBudget = Math.max(4_000, config.intelligenceMaxPayloadChars - Math.min(15_000, config.intelligenceMaxActiveEvents * 250));
+  const reportBudget = Math.max(4_000, config.intelligenceMaxPayloadChars - CURRENT_WINDOW_PROPOSAL_SYSTEM_PROMPT.length - 1_000);
   const selected: BatchReportRow[] = [];
   let estimated = 0;
   for (const candidate of candidates.results) {
@@ -500,21 +656,6 @@ async function loadBatchReports(db: D1Database, ids: number[]): Promise<BatchRep
   return result.results;
 }
 
-async function listActiveEvents(db: D1Database, limit: number): Promise<ActiveEventSummary[]> {
-  const activeSince = new Date(Date.now() - 48 * 60 * 60 * 1_000).toISOString();
-  const result = await db.prepare(
-    `SELECT e.id AS event_id, e.core_fact, e.category, e.first_seen_at, e.last_updated_at,
-            e.source_count, e.independent_confirmation_count, GROUP_CONCAT(DISTINCT s.name) AS source_names
-       FROM events e
-       LEFT JOIN event_sources es ON es.event_id = e.id
-       LEFT JOIN sources s ON s.id = es.source_id
-      WHERE e.event_state = 'active' AND e.last_updated_at >= ?
-      GROUP BY e.id
-      ORDER BY e.last_updated_at DESC LIMIT ?`
-  ).bind(activeSince, limit).all<ActiveEventSummary>();
-  return result.results;
-}
-
 async function getBatch(db: D1Database, batchId: number): Promise<IntelligenceBatchRow | null> {
   return db.prepare("SELECT * FROM intelligence_batches WHERE id = ?").bind(batchId).first<IntelligenceBatchRow>();
 }
@@ -525,24 +666,6 @@ async function completeBatch(db: D1Database, batchId: number, telemetry: string 
     `UPDATE intelligence_batches SET status = 'completed', provider_used = ?, prompt_tokens = ?, completion_tokens = ?,
        lease_at = NULL, error = NULL, completed_at = ?, updated_at = ? WHERE id = ?`
   ).bind(telemetry, promptTokens, completionTokens, timestamp, timestamp, batchId).run();
-}
-
-function summarizeNebulaUsage(usages: NebulaUsage[]): string | null {
-  if (usages.length === 0) return null;
-  return JSON.stringify({
-    requests: usages.map((usage) => ({
-      requested_model: usage.requestedModel,
-      model: usage.model,
-      provider: usage.provider,
-      routed_model: usage.routedModel,
-      fallback_attempts: usage.fallbackAttempts,
-      request_id: usage.requestId,
-      status: usage.status,
-      latency_ms: usage.latencyMs,
-      logical_attempt: usage.logicalAttempt,
-      logical_retry: usage.logicalRetry
-    }))
-  });
 }
 
 async function releaseBatchReports(db: D1Database, batchId: number, error: string): Promise<void> {
@@ -572,6 +695,10 @@ async function applyBatchDecisions(env: Env, batchId: number, reports: BatchRepo
   let duplicates = 0;
   let uncertain = 0;
 
+  if (decisions.some((decision) => ["MATCH_EXISTING_EVENT", "UPDATE_EXISTING_EVENT", "DUPLICATE"].includes(decision.action))) {
+    throw new Error("historical_semantic_linking_unsupported");
+  }
+
   for (const decision of decisions.filter((item) => item.action !== "DUPLICATE")) {
     if (decision.action === "NOISE") {
       for (const postId of decision.post_ids) {
@@ -583,9 +710,7 @@ async function applyBatchDecisions(env: Env, batchId: number, reports: BatchRepo
       continue;
     }
 
-    const targetResult = decision.action === "MATCH_EXISTING_EVENT" || decision.action === "UPDATE_EXISTING_EVENT"
-      ? { event: await requireEvent(env.DB, decision.event_id), created: false }
-      : await createEventForDecision(env, decision, reports);
+    const targetResult = await createEventForDecision(env, decision, reports);
     const target = targetResult.event;
     if (decision.action === "NEW_EVENT") newEvents += targetResult.created ? 1 : 0;
     if (decision.action === "UNCERTAIN") uncertain += 1;
@@ -605,9 +730,6 @@ async function applyBatchDecisions(env: Env, batchId: number, reports: BatchRepo
       eventForPost.set(report.id, target.id);
       affectedEventIds.add(target.id);
       await recordBatchItem(env.DB, batchId, report.id, decision, target.id);
-    }
-    if (decision.action === "UPDATE_EXISTING_EVENT") {
-      await updateEventFact(env.DB, target.id, decision.canonical_fact, decision.category);
     }
   }
 
@@ -767,11 +889,6 @@ async function markNoise(db: D1Database, report: BatchReportRow): Promise<void> 
   ).bind(report.analysis_content_hash ?? await sha256Hex(report.normalized_text || report.original_text), new Date().toISOString(), report.id).run();
 }
 
-async function updateEventFact(db: D1Database, eventId: number, canonicalFact: string, category: string): Promise<void> {
-  await db.prepare("UPDATE events SET core_fact = ?, category = ?, updated_at = ? WHERE id = ?")
-    .bind(canonicalFact, category, new Date().toISOString(), eventId).run();
-}
-
 async function recordBatchItem(db: D1Database, batchId: number, rawPostId: number, decision: IntelligenceDecision, eventId: number | null): Promise<void> {
   await db.prepare(
     `INSERT INTO intelligence_batch_items(batch_id, raw_post_id, action, event_id, duplicate_of_post_id, confidence, item_status, decision_json, created_at)
@@ -788,17 +905,17 @@ async function attachedEventId(db: D1Database, rawPostId: number): Promise<numbe
   return row?.event_id ?? null;
 }
 
+function requireReport(reports: Map<number, BatchReportRow>, postId: number): BatchReportRow {
+  const report = reports.get(postId);
+  if (!report) throw new Error(`unknown_batch_post_id:${postId}`);
+  return report;
+}
+
 async function requireEvent(db: D1Database, eventId: number | null): Promise<EventRow> {
   if (eventId === null) throw new Error("event_id_required");
   const event = await getEvent(db, eventId);
   if (!event) throw new Error(`unknown_event_id:${eventId}`);
   return event;
-}
-
-function requireReport(reports: Map<number, BatchReportRow>, postId: number): BatchReportRow {
-  const report = reports.get(postId);
-  if (!report) throw new Error(`unknown_batch_post_id:${postId}`);
-  return report;
 }
 
 async function safeIncrementCounter(db: D1Database, metric: string, amount = 1): Promise<void> {

@@ -7,6 +7,7 @@ export interface RuntimeConfig {
   maxHtmlBytes: number;
   nebulaBaseUrl: string;
   nebulaIntelligenceModel: string;
+  v8HistoricalSemanticLinkingEnabled: boolean;
   nebulaEditorialModel: string;
   nebulaIntelligenceTimeoutMs: number;
   nebulaEditorialTimeoutMs: number;
@@ -28,6 +29,8 @@ export interface RuntimeConfig {
   busyDayStoryBudget: number;
 }
 
+export const V8_CURRENT_WINDOW_MODEL = "@cf/google/gemma-4-26b-a4b-it";
+
 function numberSetting(value: string | undefined, fallback: number): number {
   const parsed = Number(value);
   return Number.isFinite(parsed) ? parsed : fallback;
@@ -44,7 +47,8 @@ export function runtimeConfig(env: Env): RuntimeConfig {
     pollIntervalSeconds: Math.max(60, numberSetting(env.POLL_INTERVAL_SECONDS, 300)),
     maxHtmlBytes: Math.max(64_000, numberSetting(env.MAX_HTML_BYTES, 524_288)),
     nebulaBaseUrl: (env.NEBULA_BASE_URL || "https://nebula-free-llm.nebula-ai-company.workers.dev/v1").replace(/\/+$/u, ""),
-    nebulaIntelligenceModel: env.NEBULA_INTELLIGENCE_MODEL || "@cf/zai-org/glm-4.7-flash",
+    nebulaIntelligenceModel: env.NEBULA_INTELLIGENCE_MODEL || V8_CURRENT_WINDOW_MODEL,
+    v8HistoricalSemanticLinkingEnabled: String(env.V8_HISTORICAL_SEMANTIC_LINKING_ENABLED) === "true",
     nebulaEditorialModel: env.NEBULA_EDITORIAL_MODEL || legacyModel,
     nebulaIntelligenceTimeoutMs: Math.max(5_000, Math.min(95_000, numberSetting(env.NEBULA_INTELLIGENCE_TIMEOUT_MS, 95_000))),
     nebulaEditorialTimeoutMs: Math.max(5_000, Math.min(55_000, numberSetting(env.NEBULA_EDITORIAL_TIMEOUT_MS, legacyTimeout))),
@@ -65,4 +69,13 @@ export function runtimeConfig(env: Env): RuntimeConfig {
     dailyStoryBudget: numberSetting(env.DAILY_STORY_BUDGET, 15),
     busyDayStoryBudget: numberSetting(env.BUSY_DAY_STORY_BUDGET, 25)
   };
+}
+
+export function assertHistoricalSemanticLinkingDisabled(config: RuntimeConfig): void {
+  if (config.v8HistoricalSemanticLinkingEnabled) throw new Error("historical_semantic_linking_unsupported");
+}
+
+export function assertCurrentWindowConfiguration(config: RuntimeConfig): void {
+  assertHistoricalSemanticLinkingDisabled(config);
+  if (config.nebulaIntelligenceModel !== V8_CURRENT_WINDOW_MODEL) throw new Error("v8_current_window_model_unsupported");
 }

@@ -61,10 +61,10 @@ describe("V8 backtest contract", () => {
     expect(backtestSource).toContain("end_to_end_latency_samples");
   });
 
-  it("keeps D1 application after final deterministic validation", () => {
-    expect(pipelineSource.indexOf("const finalValidation = await validateDecisionSetWithCorrection")).toBeGreaterThan(-1);
+  it("keeps D1 application after final current-window validation", () => {
+    expect(pipelineSource.indexOf("const validatedDecisions = validateIntelligenceDecisions")).toBeGreaterThan(-1);
     expect(pipelineSource.indexOf("const outcome = await applyBatchDecisions")).toBeGreaterThan(-1);
-    expect(pipelineSource.indexOf("const finalValidation = await validateDecisionSetWithCorrection")).toBeLessThan(pipelineSource.indexOf("const outcome = await applyBatchDecisions"));
+    expect(pipelineSource.indexOf("const validatedDecisions = validateIntelligenceDecisions")).toBeLessThan(pipelineSource.indexOf("const outcome = await applyBatchDecisions"));
   });
 
   it("keeps the bounded Queue retry safety net unchanged", () => {

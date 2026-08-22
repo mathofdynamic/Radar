@@ -6,7 +6,13 @@ import { incrementCounter, reserveNebulaCall, reserveWorkersAiCall } from "../db
 import type { JsonObject } from "../types";
 
 export type GeneratedImageMimeType = "image/png" | "image/jpeg";
-export type NebulaStage = "intelligence" | "intelligence_second_pass" | "stage1" | "stage2";
+export type NebulaStage =
+  | "intelligence"
+  | "intelligence_second_pass"
+  | "intelligence_proposal"
+  | "intelligence_pair"
+  | "stage1"
+  | "stage2";
 
 export interface GeneratedImage {
   bytes: ArrayBuffer;
@@ -26,6 +32,7 @@ export interface NebulaUsage {
   completionTokens: number;
   logicalAttempt: number;
   logicalRetry: boolean;
+  attemptStatuses: Array<number | null>;
 }
 
 export interface NebulaJsonResult<T> {
@@ -57,10 +64,14 @@ export interface NebulaTelemetry {
   latencyMs: number;
   logicalAttempt: number;
   logicalRetry: boolean;
+  attemptStatuses: Array<number | null>;
 }
 
 export interface NebulaRequestOptions {
   responseSchema?: Record<string, unknown>;
+  responseSchemaName?: string;
+  chatTemplateKwargs?: Record<string, unknown>;
+  completionParameter?: "max_tokens" | "max_completion_tokens";
 }
 
 const nebulaJsonSchema = z.record(z.unknown());
@@ -78,18 +89,22 @@ export async function generateNebulaJson<T>(
   const apiKey = env.NEBULA_API_KEY?.trim();
   if (!apiKey) throw new NebulaError("nebula_api_key_missing");
 
-  const isIntelligence = stage === "intelligence" || stage === "intelligence_second_pass";
+  const isIntelligence = stage === "intelligence"
+    || stage === "intelligence_second_pass"
+    || stage === "intelligence_proposal"
+    || stage === "intelligence_pair";
   const requestedModel = isIntelligence ? config.nebulaIntelligenceModel : config.nebulaEditorialModel;
   const timeoutMs = isIntelligence ? config.nebulaIntelligenceTimeoutMs : config.nebulaEditorialTimeoutMs;
 
-  const maxCalls = stage === "intelligence"
+  const maxCalls = stage === "intelligence" || stage === "intelligence_proposal"
     ? config.maxIntelligenceBatchesPerDay
-    : stage === "intelligence_second_pass"
+    : stage === "intelligence_second_pass" || stage === "intelligence_pair"
       ? config.maxIntelligenceSecondPassCallsPerDay
       : stage === "stage1"
         ? config.maxStage1CallsPerDay
         : config.maxStage2CallsPerDay;
   const maxLogicalAttempts = isIntelligence ? 2 : 1;
+  const attemptStatuses: Array<number | null> = [];
   for (let logicalAttempt = 1; logicalAttempt <= maxLogicalAttempts; logicalAttempt += 1) {
     const reserved = await reserveNebulaCall(env.DB, stage, maxCalls);
     if (!reserved) {
@@ -98,6 +113,8 @@ export async function generateNebulaJson<T>(
     }
     await safeIncrementCounter(env.DB, "intelligence_ai_calls");
     if (stage === "intelligence_second_pass") await safeIncrementCounter(env.DB, "intelligence_second_pass_calls");
+    if (stage === "intelligence_proposal") await safeIncrementCounter(env.DB, "v8_current_window_proposal_calls");
+    if (stage === "intelligence_pair") await safeIncrementCounter(env.DB, "v8_current_window_pair_calls");
 
     const controller = new AbortController();
     const timeoutId = setTimeout(() => controller.abort(), timeoutMs);
@@ -111,7 +128,8 @@ export async function generateNebulaJson<T>(
       status: null,
       latencyMs: 0,
       logicalAttempt,
-      logicalRetry: logicalAttempt > 1
+      logicalRetry: logicalAttempt > 1,
+      attemptStatuses: []
     };
     try {
       const response = await fetch(`${config.nebulaBaseUrl}/chat/completions`, {
@@ -128,21 +146,25 @@ export async function generateNebulaJson<T>(
             { role: "user", content: userPrompt }
           ],
           response_format: isIntelligence
-            ? {
-                type: "json_schema",
-                json_schema: {
-                  name: "radar_intelligence_batch",
+             ? {
+                 type: "json_schema",
+                 json_schema: {
+                  name: options.responseSchemaName ?? "radar_intelligence_batch",
                   strict: true,
                   schema: options.responseSchema ?? intelligenceBatchJsonSchema
                 }
               }
             : { type: "json_object" },
           temperature: 0.1,
-          max_tokens: maxTokens
+          ...(options.completionParameter === "max_completion_tokens"
+            ? { max_completion_tokens: maxTokens }
+            : { max_tokens: maxTokens }),
+          ...(options.chatTemplateKwargs ? { chat_template_kwargs: options.chatTemplateKwargs } : {})
         }),
         signal: controller.signal
       });
       telemetry = readNebulaTelemetry(response, requestedModel, startedAt, logicalAttempt);
+      attemptStatuses.push(response.status);
       const responseText = await readBoundedText(response, 2_000_000);
       if (!response.ok) {
         throw new NebulaError(
@@ -172,17 +194,19 @@ export async function generateNebulaJson<T>(
           ...telemetry,
           model: responseModel ?? telemetry.routedModel ?? requestedModel,
           promptTokens: getNumber(usage.prompt_tokens),
-          completionTokens: getNumber(usage.completion_tokens)
+          completionTokens: getNumber(usage.completion_tokens),
+          attemptStatuses: [...attemptStatuses]
         }
       };
     } catch (error) {
+      if (attemptStatuses.length < logicalAttempt) attemptStatuses.push(telemetry.status);
       await safeIncrementCounter(env.DB, "intelligence_ai_failures");
       const normalized = error instanceof NebulaError
-        ? error
+        ? new NebulaError(error.message, error.status, error.telemetry ? { ...error.telemetry, attemptStatuses: [...attemptStatuses] } : { ...telemetry, attemptStatuses: [...attemptStatuses] }, error.retryable)
         : new NebulaError(
           error instanceof Error ? error.message : "nebula_request_failed",
           null,
-          { ...telemetry, latencyMs: Date.now() - startedAt },
+          { ...telemetry, latencyMs: Date.now() - startedAt, attemptStatuses: [...attemptStatuses] },
           isTransientTransportError(error)
         );
       if (logicalAttempt < maxLogicalAttempts && normalized.retryable) {
@@ -219,7 +243,8 @@ function readNebulaTelemetry(response: Response, requestedModel: string, started
     status: response.status,
     latencyMs: Date.now() - startedAt,
     logicalAttempt,
-    logicalRetry: logicalAttempt > 1
+    logicalRetry: logicalAttempt > 1,
+    attemptStatuses: []
   };
 }
 
@@ -227,9 +252,8 @@ function isTransientGatewayStatus(status: number): boolean {
   return status === 502 || status === 503 || status === 504;
 }
 
-function isTransientTransportError(error: unknown): boolean {
-  if (!(error instanceof Error)) return true;
-  return error.name !== "AbortError" && error.name !== "TimeoutError";
+function isTransientTransportError(_error: unknown): boolean {
+  return true;
 }
 
 async function waitForLogicalRetry(): Promise<void> {

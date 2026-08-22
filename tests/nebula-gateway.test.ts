@@ -22,7 +22,7 @@ function fakeEnv(): Env {
     DB: db,
     NEBULA_API_KEY: "test-key",
     NEBULA_BASE_URL: "https://nebula.example/v1",
-    NEBULA_INTELLIGENCE_MODEL: "@cf/zai-org/glm-4.7-flash",
+    NEBULA_INTELLIGENCE_MODEL: "@cf/google/gemma-4-26b-a4b-it",
     NEBULA_EDITORIAL_MODEL: "auto",
     NEBULA_MODEL: "auto",
     NEBULA_INTELLIGENCE_TIMEOUT_MS: "95000",
@@ -49,16 +49,16 @@ const validOutput = {
 };
 
 describe("Nebula gateway", () => {
-  it("uses the GLM intelligence default, strict JSON Schema, and captures routing headers", async () => {
+  it("uses the Gemma intelligence default, strict JSON Schema, and captures routing headers", async () => {
     const fetchMock = vi.spyOn(globalThis, "fetch").mockResolvedValue(new Response(JSON.stringify({
-      model: "@cf/zai-org/glm-4.7-flash",
+      model: "@cf/google/gemma-4-26b-a4b-it",
       usage: { prompt_tokens: 12, completion_tokens: 8 },
       choices: [{ message: { content: JSON.stringify(validOutput) } }]
     }), {
       status: 200,
       headers: {
         "content-type": "application/json",
-        "x-routed-via": "cloudflare/@cf/meta/llama-3.1-8b-instruct-fast",
+        "x-routed-via": "cloudflare/@cf/google/gemma-4-26b-a4b-it",
         "x-fallback-attempts": "2",
         "x-request-id": "req-test-123"
       }
@@ -67,24 +67,49 @@ describe("Nebula gateway", () => {
       const result = await generateNebulaJson(fakeEnv(), "intelligence", "system", "user", intelligenceBatchOutputSchema);
       expect(result?.data).toEqual(validOutput);
       expect(result?.usage.promptTokens).toBe(12);
-      expect(result?.usage.requestedModel).toBe("@cf/zai-org/glm-4.7-flash");
+      expect(result?.usage.requestedModel).toBe("@cf/google/gemma-4-26b-a4b-it");
       expect(result?.usage.provider).toBe("cloudflare");
-      expect(result?.usage.routedModel).toBe("@cf/meta/llama-3.1-8b-instruct-fast");
+      expect(result?.usage.routedModel).toBe("@cf/google/gemma-4-26b-a4b-it");
       expect(result?.usage.fallbackAttempts).toBe(2);
       expect(result?.usage.requestId).toBe("req-test-123");
       expect(result?.usage.status).toBe(200);
       expect(result?.usage.latencyMs).toBeGreaterThanOrEqual(0);
       const request = fetchMock.mock.calls[0]?.[1] as RequestInit;
       const body = JSON.parse(String(request.body)) as { model: string; response_format: { type: string; json_schema: { name: string; strict: boolean; schema: typeof intelligenceBatchJsonSchema } } };
-      expect(body.model).toBe("@cf/zai-org/glm-4.7-flash");
+      expect(body.model).toBe("@cf/google/gemma-4-26b-a4b-it");
       expect(body.response_format.type).toBe("json_schema");
       expect(body.response_format.json_schema.name).toBe("radar_intelligence_batch");
       expect(body.response_format.json_schema.strict).toBe(true);
       expect(body.response_format.json_schema.schema).toEqual(intelligenceBatchJsonSchema);
       expect(fetchMock).toHaveBeenCalledWith("https://nebula.example/v1/chat/completions", expect.objectContaining({
         method: "POST",
-        body: expect.stringContaining('"model":"@cf/zai-org/glm-4.7-flash"')
+        body: expect.stringContaining('"model":"@cf/google/gemma-4-26b-a4b-it"')
       }));
+    } finally {
+      fetchMock.mockRestore();
+    }
+  });
+
+  it("supports the current-window exact model request without thinking", async () => {
+    const fetchMock = vi.spyOn(globalThis, "fetch").mockResolvedValue(new Response(JSON.stringify({
+      model: "@cf/google/gemma-4-26b-a4b-it",
+      usage: { prompt_tokens: 10, completion_tokens: 4 },
+      choices: [{ message: { content: JSON.stringify({ relationship: "SAME_EVENT", confidence: 0.99 }) } }]
+    }), { status: 200 }));
+    try {
+      await generateNebulaJson(fakeEnv(), "intelligence_pair", "system", "user", z.object({ relationship: z.literal("SAME_EVENT"), confidence: z.number() }), 150, {
+        responseSchema: { type: "object", additionalProperties: false },
+        responseSchemaName: "radar_current_window_pair",
+        chatTemplateKwargs: { enable_thinking: false },
+        completionParameter: "max_completion_tokens"
+      });
+      const request = fetchMock.mock.calls[0]?.[1] as RequestInit;
+      const body = JSON.parse(String(request.body)) as { model: string; max_completion_tokens: number; max_tokens?: number; chat_template_kwargs: { enable_thinking: boolean }; response_format: { json_schema: { name: string } } };
+      expect(body.model).toBe("@cf/google/gemma-4-26b-a4b-it");
+      expect(body.max_completion_tokens).toBe(150);
+      expect(body.max_tokens).toBeUndefined();
+      expect(body.chat_template_kwargs).toEqual({ enable_thinking: false });
+      expect(body.response_format.json_schema.name).toBe("radar_current_window_pair");
     } finally {
       fetchMock.mockRestore();
     }
