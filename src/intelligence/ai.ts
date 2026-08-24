@@ -109,7 +109,7 @@ export async function generateNebulaJson<T>(
     const reserved = await reserveNebulaCall(env.DB, stage, maxCalls);
     if (!reserved) {
       if (logicalAttempt > 1) await safeIncrementCounter(env.DB, "nebula_logical_retry_failures");
-      return null;
+      throw new NebulaError("nebula_daily_budget_exhausted");
     }
     await safeIncrementCounter(env.DB, "intelligence_ai_calls");
     if (stage === "intelligence_second_pass") await safeIncrementCounter(env.DB, "intelligence_second_pass_calls");

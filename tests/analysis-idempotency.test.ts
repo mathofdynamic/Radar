@@ -8,8 +8,26 @@ import {
   normalizeLegacyAnalysisStatus,
   shouldSkipAnalyzedPost
 } from "../src/intelligence/analysis-state";
+import { getEventByOriginatingRawPostId } from "../src/db";
 
 describe("V8 analysis idempotency", () => {
+  it("recovers an event row left behind before its source evidence was attached", async () => {
+    const event = { id: 42, originating_raw_post_id: 7 };
+    const db = {
+      prepare(sql: string) {
+        expect(sql).toContain("originating_raw_post_id");
+        return {
+          bind(rawPostId: number) {
+            expect(rawPostId).toBe(7);
+            return { first: async () => event };
+          }
+        };
+      }
+    } as unknown as D1Database;
+
+    await expect(getEventByOriginatingRawPostId(db, 7)).resolves.toEqual(event);
+  });
+
   it("normalizes unfinished V6 states into recoverable pending work", () => {
     expect(normalizeLegacyAnalysisStatus("embedding")).toBe("pending");
     expect(normalizeLegacyAnalysisStatus("embedded")).toBe("pending");

@@ -163,6 +163,11 @@ export async function getEvent(db: D1Database, eventId: number): Promise<EventRo
   return db.prepare("SELECT * FROM events WHERE id = ?").bind(eventId).first<EventRow>();
 }
 
+export async function getEventByOriginatingRawPostId(db: D1Database, rawPostId: number): Promise<EventRow | null> {
+  return db.prepare("SELECT * FROM events WHERE originating_raw_post_id = ? ORDER BY id DESC LIMIT 1")
+    .bind(rawPostId).first<EventRow>();
+}
+
 export async function getSource(db: D1Database, sourceId: number): Promise<SourceRow | null> {
   return db.prepare(
     `SELECT id, source_key, name, telegram_username, role, priority_tier, category, language, source_type,
@@ -232,16 +237,13 @@ export async function reserveWorkersAiCall(db: D1Database, stage: string, maxCal
 export async function reserveNebulaCall(db: D1Database, stage: string, maxCalls: number): Promise<boolean> {
   if (maxCalls <= 0) return false;
   const date = new Date().toISOString().slice(0, 10);
-  const stageUsage = await db.prepare("SELECT calls FROM ai_usage WHERE usage_date = ? AND stage = ?")
-    .bind(date, stage).first<{ calls: number }>();
-  if ((stageUsage?.calls ?? 0) >= maxCalls) return false;
-
   const timestamp = nowIso();
-  await db.prepare(
+  const reservation = await db.prepare(
     `INSERT INTO ai_usage(usage_date, stage, calls, estimated_neurons, updated_at) VALUES (?, ?, 1, 0, ?)
-     ON CONFLICT(usage_date, stage) DO UPDATE SET calls = calls + 1, updated_at = excluded.updated_at`
-  ).bind(date, stage, timestamp).run();
-  return true;
+     ON CONFLICT(usage_date, stage) DO UPDATE SET calls = calls + 1, updated_at = excluded.updated_at
+     WHERE ai_usage.calls < ?`
+  ).bind(date, stage, timestamp, maxCalls).run();
+  return Number(reservation.meta.changes ?? 0) > 0;
 }
 
 export async function countStoriesToday(db: D1Database): Promise<number> {

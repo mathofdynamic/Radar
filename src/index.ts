@@ -12,6 +12,7 @@ import { judgeEvent } from "./editorial/judge";
 import { scoreEvent, scoreWithAdjustment, shouldPublish } from "./editorial/scoring";
 import { pollDueSources } from "./polling/poller";
 import { createCover } from "./publisher/covers";
+import { evaluateTelegramCanary, telegramCanaryConfig } from "./publisher/canary";
 import { editPublishedStory, publishStory, verifyTelegramDestination } from "./publisher/telegram";
 import { isAdminRequest, isOperatorRequest, healthResponse, opsSummary } from "./ops";
 import type { PublishJob, SourceSeed, StoryDraft, TelegramWebPollEnvelope, VerificationStatus } from "./types";
@@ -347,6 +348,19 @@ async function processPublish(env: Env, job: PublishQueueJob): Promise<void> {
       env.DB.prepare("UPDATE editorial_candidates SET status = ?, updated_at = ? WHERE event_id = ? AND event_version = ?")
         .bind(job.job.mode === "edit" ? "update_pending" : "pending", timestamp, job.job.eventId, job.job.eventVersion)
     ]);
+    return;
+  }
+
+  const canary = await evaluateTelegramCanary(env.DB, telegramCanaryConfig(runtimeConfig(env)));
+  if (!canary.allowed) {
+    await safeIncrementCounter(env.DB, "telegram_canary_blocked");
+    console.warn(JSON.stringify({
+      event: "telegram_canary_blocked",
+      reason: canary.reason,
+      total: canary.counts.total,
+      hourly: canary.counts.hourly,
+      cycle: canary.counts.cycle
+    }));
     return;
   }
 

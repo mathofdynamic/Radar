@@ -27,6 +27,7 @@ export interface CurrentWindowPairCheck {
   leftPostId: number;
   rightPostId: number;
   result: CurrentWindowPair | null;
+  hardContradictions?: readonly string[];
 }
 
 export interface ReconstructedCurrentWindowCluster {
@@ -113,7 +114,7 @@ export function reconstructCurrentWindowClusters(
 
     const clusterPostIds = new Set(proposedCluster.post_ids);
     const usableEdges = pairChecks
-      .filter((check) => clusterPostIds.has(check.leftPostId) && clusterPostIds.has(check.rightPostId) && acceptsCurrentWindowPair(check.result))
+      .filter((check) => clusterPostIds.has(check.leftPostId) && clusterPostIds.has(check.rightPostId) && acceptsCurrentWindowPair(check.result) && (check.hardContradictions?.length ?? 0) === 0)
       .map((check) => ({
         leftPostId: check.leftPostId,
         rightPostId: check.rightPostId,

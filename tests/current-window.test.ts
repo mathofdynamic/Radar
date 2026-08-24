@@ -9,7 +9,9 @@ import {
   validateCurrentWindowPair,
   validateCurrentWindowProposal
 } from "../src/intelligence/current-window";
+import { findCurrentWindowHardContradictions } from "../src/intelligence/hard-contradictions";
 import { assertCurrentWindowConfiguration, assertHistoricalSemanticLinkingDisabled, runtimeConfig, V8_CURRENT_WINDOW_MODEL } from "../src/config";
+import locationRegressionFixture from "./fixtures/v8-location-contradiction-15325-15342.json";
 
 const event = (postIds: number[], confidence = 0.99) => ({
   post_ids: postIds,
@@ -68,6 +70,70 @@ describe("V8 current-window proposal and pair contracts", () => {
     expect(currentWindowPairOutputSchema.safeParse({ relationship: "DIFFERENT_EVENT", confidence: 0.9 }).success).toBe(true);
   });
 
+  it("vetoes the production Amol versus Sadeghieh location contradiction", () => {
+    const [left, right] = locationRegressionFixture.reports;
+    expect(findCurrentWindowHardContradictions(
+      { original_text: left.text, normalized_text: left.text },
+      { original_text: right.text, normalized_text: right.text }
+    )).toEqual(["incompatible_explicit_locations"]);
+    const clusters = reconstructCurrentWindowClusters(
+      { clusters: [event([15325, 15342])] },
+      [{
+        leftPostId: 15325,
+        rightPostId: 15342,
+        result: { relationship: "SAME_EVENT", confidence: 0.99 },
+        hardContradictions: ["incompatible_explicit_locations"]
+      }]
+    );
+    expect(clusters.map((cluster) => cluster.postIds)).toEqual([[15325], [15342]]);
+  });
+
+  it("allows reliable parent-child location containment", () => {
+    expect(findCurrentWindowHardContradictions(
+      { original_text: "خبر در تهران", normalized_text: "خبر در تهران" },
+      { original_text: "حادثه در میدان صادقیه", normalized_text: "حادثه در میدان صادقیه" }
+    )).toEqual([]);
+    expect(findCurrentWindowHardContradictions(
+      { original_text: "خبر در ایران", normalized_text: "خبر در ایران" },
+      { original_text: "خبر در تهران", normalized_text: "خبر در تهران" }
+    )).toEqual([]);
+  });
+
+  it("vetoes incompatible sibling cities for a local occurrence", () => {
+    expect(findCurrentWindowHardContradictions(
+      { original_text: "آتش سوزی در تهران", normalized_text: "آتش سوزی در تهران" },
+      { original_text: "آتش سوزی در مشهد", normalized_text: "آتش سوزی در مشهد" }
+    )).toEqual(["incompatible_explicit_locations"]);
+  });
+
+  it("does not assert a contradiction for unknown locations", () => {
+    expect(findCurrentWindowHardContradictions(
+      { original_text: "حادثه در شهر ناشناخته", normalized_text: "حادثه در شهر ناشناخته" },
+      { original_text: "حادثه در نقطه ناشناخته", normalized_text: "حادثه در نقطه ناشناخته" }
+    )).toEqual([]);
+  });
+
+  it("normalizes equivalent city spellings and preserves shared multi-location events", () => {
+    expect(findCurrentWindowHardContradictions(
+      { original_text: "خبر در تهران", normalized_text: "خبر در تهران" },
+      { original_text: "خبر در طهران", normalized_text: "خبر در طهران" }
+    )).toEqual([]);
+    expect(findCurrentWindowHardContradictions(
+      { original_text: "مراسم در تهران و مشهد برگزار می‌شود", normalized_text: "مراسم در تهران و مشهد برگزار می‌شود" },
+      { original_text: "برگزاری مراسم در مشهد و تهران", normalized_text: "برگزاری مراسم در مشهد و تهران" }
+    )).toEqual([]);
+  });
+
+  it("keeps the confidence gate and different-event rejection authoritative", () => {
+    expect(acceptsCurrentWindowPair({ relationship: "SAME_EVENT", confidence: 0.949 })).toBe(false);
+    expect(acceptsCurrentWindowPair({ relationship: "DIFFERENT_EVENT", confidence: 0.99 })).toBe(false);
+    const clusters = reconstructCurrentWindowClusters(
+      { clusters: [event([15325, 15342])] },
+      [{ leftPostId: 15325, rightPostId: 15342, result: { relationship: "DIFFERENT_EVENT", confidence: 0.99 } }]
+    );
+    expect(clusters.map((cluster) => cluster.postIds)).toEqual([[15325], [15342]]);
+  });
+
   it("keeps the provider contract historical-free and the flag disabled by default", () => {
     const schema = JSON.stringify(currentWindowProposalJsonSchema([1, 2]));
     expect(schema).not.toContain("event_id");
@@ -87,13 +153,15 @@ describe("V8 current-window proposal and pair contracts", () => {
     expect(() => assertCurrentWindowConfiguration(wrongModel)).toThrow("v8_current_window_model_unsupported");
   });
 
-  it("does not expose the removed historical decision path or enable publishing", () => {
+  it("does not expose the removed historical decision path and keeps normal publishing explicit", () => {
     const pipelineSource = readFileSync(resolve(process.cwd(), "src/intelligence/pipeline.ts"), "utf8");
     const wranglerSource = readFileSync(resolve(process.cwd(), "wrangler.jsonc"), "utf8");
     expect(pipelineSource).not.toContain("listActiveEvents");
     expect(pipelineSource).not.toContain("active_events");
     expect(pipelineSource).not.toContain("requestBatchDecisions");
     expect(pipelineSource).toContain("historical_semantic_linking_unsupported");
-    expect(wranglerSource).toContain('"PUBLISH_ENABLED": "false"');
+    expect(wranglerSource).toContain('"PUBLISH_ENABLED": "true"');
+    expect(wranglerSource).toContain('"TELEGRAM_CANARY_ENABLED": "false"');
+    expect(wranglerSource).toContain('"V8_HISTORICAL_SEMANTIC_LINKING_ENABLED": "false"');
   });
 });

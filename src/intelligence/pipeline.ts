@@ -3,6 +3,7 @@ import { sha256Hex } from "../crypto";
 import {
   claimIntelligenceReport,
   getEvent,
+  getEventByOriginatingRawPostId,
   getSource,
   incrementCounter,
   markRawPostAnalyzed,
@@ -29,6 +30,7 @@ import {
   type ReconstructedCurrentWindowCluster
 } from "./current-window";
 import { extractEntityKeys, inferCategory } from "./similarity";
+import { findCurrentWindowHardContradictions } from "./hard-contradictions";
 import { calculateVerification, classifyOrigin, originGroupFor, persistVerification } from "./verification";
 import { scoreEvent } from "../editorial/scoring";
 import { intelligenceBatchOutputSchema, scopeIntelligenceBatchJsonSchema } from "../contracts";
@@ -83,7 +85,11 @@ export interface CurrentWindowTelemetry {
   pair_verification_calls: number;
   pair_verification_retries: number;
   pair_verification_failures: number;
+  pair_budget_failures: number;
+  budget_failures: number;
+  raw_same_event_edges: number;
   accepted_same_event_edges: number;
+  hard_contradiction_vetoes: number;
   rejected_edges: number;
   final_multi_report_clusters: number;
   final_singletons: number;
@@ -125,10 +131,12 @@ const CURRENT_WINDOW_PAIR_SYSTEM_PROMPT = `You are Radar's conservative current-
 Determine whether exactly these two supplied reports describe the SAME concrete real-world occurrence.
 SAME_EVENT requires the same specific occurrence, announcement, incident, decision, attack, accident, restriction, forecast, publication, match, transaction, or other concrete event.
 Shared people, organizations, countries, cities, conflicts, companies, sports, political themes, categories, or keywords are insufficient.
+If the reports contain incompatible specific locations for one occurrence, return DIFFERENT_EVENT. Parent and child locations can be compatible when one is inside the other.
 When uncertain, return UNCERTAIN. False SAME_EVENT is more harmful than false DIFFERENT_EVENT.
 Return JSON only with relationship and confidence.`;
 
 const CURRENT_WINDOW_CHAT_TEMPLATE_KWARGS = { enable_thinking: false };
+const CURRENT_WINDOW_PAIR_CONCURRENCY = 2;
 
 export async function ingestEnvelope(env: Env, envelope: TelegramWebPollEnvelope, options: IngestOptions = {}): Promise<number> {
   const source = await getSource(env.DB, envelope.sourceId);
@@ -326,22 +334,49 @@ export async function runCurrentWindowShadow(
     proposalResult = { ...proposalResult, data: validateCurrentWindowProposal(proposalResult.data, reports.map((report) => report.id)) };
   } catch (error) {
     recordNebulaFailureTelemetry(telemetry, error, false);
+    if (error instanceof NebulaError && error.message === "nebula_daily_budget_exhausted") telemetry.budget_failures += 1;
     throw error;
   }
   if (!proposalResult) throw new NebulaError("v8_current_window_proposal_unavailable");
   telemetry.proposal_clusters = proposalResult.data.clusters.length;
   telemetry.proposal_singletons = proposalResult.data.clusters.filter((cluster) => cluster.post_ids.length === 1).length;
 
-  const pairChecks: CurrentWindowPairCheck[] = [];
+  const pairWork: Array<{ leftPostId: number; rightPostId: number }> = [];
   for (const cluster of proposalResult.data.clusters) {
     if (cluster.classification !== "EVENT" || cluster.post_ids.length < 2) continue;
     for (const [leftPostId, rightPostId] of allPairs(cluster.post_ids)) {
-      telemetry.pair_verification_calls += 1;
-      const pairResult = await requestCurrentWindowPair(env, reports, leftPostId, rightPostId, telemetry);
-      pairChecks.push({ leftPostId, rightPostId, result: pairResult?.data ?? null });
-      if (pairResult?.data && acceptsCurrentWindowPair(pairResult.data)) telemetry.accepted_same_event_edges += 1;
-      else telemetry.rejected_edges += 1;
+      pairWork.push({ leftPostId, rightPostId });
     }
+  }
+
+  telemetry.pair_verification_calls += pairWork.length;
+  const reportById = new Map(reports.map((report) => [report.id, report]));
+  const pairChecks = await mapWithConcurrency(pairWork, CURRENT_WINDOW_PAIR_CONCURRENCY, async ({ leftPostId, rightPostId }) => {
+    const pairResult = await requestCurrentWindowPair(env, reports, leftPostId, rightPostId, telemetry);
+    const modelPair = pairResult?.data ?? null;
+    const modelAccepted = acceptsCurrentWindowPair(modelPair);
+    if (modelAccepted) telemetry.raw_same_event_edges += 1;
+    const left = reportById.get(leftPostId);
+    const right = reportById.get(rightPostId);
+    const hardContradictions = modelAccepted && left && right
+      ? findCurrentWindowHardContradictions(left, right)
+      : [];
+    return { leftPostId, rightPostId, result: modelPair, hardContradictions } satisfies CurrentWindowPairCheck;
+  });
+
+  for (const { leftPostId, rightPostId, result: modelPair, hardContradictions } of pairChecks) {
+    if (hardContradictions.length > 0) {
+      telemetry.hard_contradiction_vetoes += 1;
+      telemetry.rejected_edges += 1;
+      console.warn(JSON.stringify({
+        event: "v8_current_window_pair_hard_contradiction_veto",
+        left_post_id: leftPostId,
+        right_post_id: rightPostId,
+        reasons: hardContradictions,
+        historical_semantic_links_attempted: 0
+      }));
+    } else if (acceptsCurrentWindowPair(modelPair)) telemetry.accepted_same_event_edges += 1;
+    else telemetry.rejected_edges += 1;
   }
 
   const finalClusters = reconstructCurrentWindowClusters(proposalResult.data, pairChecks);
@@ -420,6 +455,7 @@ async function requestCurrentWindowPair(
     rules: [
       "Return SAME_EVENT only for the same concrete real-world occurrence.",
       "Shared topics, entities, organizations, places, or categories are insufficient.",
+      "Incompatible specific locations reject SAME_EVENT; parent and child locations can be compatible when one is inside the other.",
       "Return DIFFERENT_EVENT for distinct occurrences and UNCERTAIN when evidence is insufficient.",
       "Return exactly relationship and confidence."
     ]
@@ -451,6 +487,10 @@ async function requestCurrentWindowPair(
     recordNebulaFailureTelemetry(telemetry, error, true);
     if (error instanceof CurrentWindowValidationError || (error instanceof NebulaError && (error.message.includes("schema") || error.message.includes("response_not_json")))) telemetry.contract_failures += 1;
     else telemetry.model_failures += 1;
+    if (error instanceof NebulaError && error.message === "nebula_daily_budget_exhausted") {
+      telemetry.pair_budget_failures += 1;
+      telemetry.budget_failures += 1;
+    }
     console.warn(JSON.stringify({
       event: "v8_current_window_pair_failed_closed",
       left_post_id: leftPostId,
@@ -468,6 +508,27 @@ function allPairs(postIds: readonly number[]): Array<[number, number]> {
     for (let right = left + 1; right < postIds.length; right += 1) pairs.push([postIds[left], postIds[right]]);
   }
   return pairs;
+}
+
+async function mapWithConcurrency<T, R>(
+  items: readonly T[],
+  concurrency: number,
+  mapper: (item: T, index: number) => Promise<R>
+): Promise<R[]> {
+  if (items.length === 0) return [];
+  const results: R[] = [];
+  let nextIndex = 0;
+  const workerCount = Math.min(Math.max(1, concurrency), items.length);
+  const workers = Array.from({ length: workerCount }, async () => {
+    while (true) {
+      const index = nextIndex;
+      nextIndex += 1;
+      if (index >= items.length) return;
+      results[index] = await mapper(items[index], index);
+    }
+  });
+  await Promise.all(workers);
+  return results;
 }
 
 function buildCurrentWindowDecisions(clusters: readonly ReconstructedCurrentWindowCluster[], reports: readonly BatchReportRow[]): IntelligenceDecision[] {
@@ -504,7 +565,11 @@ function createCurrentWindowTelemetry(reportsConsidered: number): CurrentWindowT
     pair_verification_calls: 0,
     pair_verification_retries: 0,
     pair_verification_failures: 0,
+    pair_budget_failures: 0,
+    budget_failures: 0,
+    raw_same_event_edges: 0,
     accepted_same_event_edges: 0,
+    hard_contradiction_vetoes: 0,
     rejected_edges: 0,
     final_multi_report_clusters: 0,
     final_singletons: 0,
@@ -789,6 +854,8 @@ async function createEventForDecision(env: Env, decision: IntelligenceDecision, 
       return { event, created: false };
     }
   }
+  const orphanedEvent = await getEventByOriginatingRawPostId(env.DB, firstReport.id);
+  if (orphanedEvent) return { event: orphanedEvent, created: false };
   const timestamp = new Date().toISOString();
   const result = await env.DB.prepare(
     `INSERT INTO events(core_fact, category, first_seen_at, last_updated_at, originating_raw_post_id, created_at, updated_at)
@@ -802,7 +869,9 @@ async function createEventForDecision(env: Env, decision: IntelligenceDecision, 
     timestamp,
     timestamp
   ).run();
-  const eventId = Number(result.meta.last_row_id ?? 0) || (await attachedEventId(env.DB, firstReport.id));
+  const eventId = Number(result.meta.last_row_id ?? 0)
+    || (await attachedEventId(env.DB, firstReport.id))
+    || (await getEventByOriginatingRawPostId(env.DB, firstReport.id))?.id;
   if (!eventId) throw new Error(`event_create_missing:${firstReport.id}`);
   const event = await requireEvent(env.DB, eventId);
   return { event, created: Number(result.meta.changes ?? 0) > 0 };

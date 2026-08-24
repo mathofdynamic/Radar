@@ -2,6 +2,11 @@ export interface RuntimeConfig {
   destinationChatId: string;
   destinationUrl: string;
   publishEnabled: boolean;
+  telegramCanaryEnabled: boolean;
+  telegramCanaryStartAt: string;
+  telegramCanaryMaxPerCycle: number;
+  telegramCanaryMaxPerHour: number;
+  telegramCanaryMaxTotal: number;
   pollBatchSize: number;
   pollIntervalSeconds: number;
   maxHtmlBytes: number;
@@ -43,6 +48,11 @@ export function runtimeConfig(env: Env): RuntimeConfig {
     destinationChatId: env.RADAR_DESTINATION_CHAT_ID,
     destinationUrl: env.RADAR_DESTINATION_URL,
     publishEnabled: String(env.PUBLISH_ENABLED) === "true",
+    telegramCanaryEnabled: String(env.TELEGRAM_CANARY_ENABLED) === "true",
+    telegramCanaryStartAt: env.TELEGRAM_CANARY_START_AT || "",
+    telegramCanaryMaxPerCycle: Math.max(1, Math.floor(numberSetting(env.TELEGRAM_CANARY_MAX_PER_CYCLE, 1))),
+    telegramCanaryMaxPerHour: Math.max(1, Math.floor(numberSetting(env.TELEGRAM_CANARY_MAX_PER_HOUR, 2))),
+    telegramCanaryMaxTotal: Math.max(1, Math.floor(numberSetting(env.TELEGRAM_CANARY_MAX_TOTAL, 5))),
     pollBatchSize: Math.max(1, Math.min(10, numberSetting(env.POLL_BATCH_SIZE, 5))),
     pollIntervalSeconds: Math.max(60, numberSetting(env.POLL_INTERVAL_SECONDS, 300)),
     maxHtmlBytes: Math.max(64_000, numberSetting(env.MAX_HTML_BYTES, 524_288)),
@@ -58,7 +68,7 @@ export function runtimeConfig(env: Env): RuntimeConfig {
     intelligenceMaxReportChars: Math.max(400, Math.min(4_000, numberSetting(env.INTELLIGENCE_MAX_REPORT_CHARS, 1_800))),
     intelligenceAmbiguityThreshold: Math.max(0, Math.min(1, numberSetting(env.INTELLIGENCE_AMBIGUITY_THRESHOLD, 0.72))),
     maxIntelligenceBatchesPerDay: Math.max(1, numberSetting(env.MAX_INTELLIGENCE_BATCHES_PER_DAY, 500)),
-    maxIntelligenceSecondPassCallsPerDay: Math.max(0, numberSetting(env.MAX_INTELLIGENCE_SECOND_PASS_CALLS_PER_DAY, 100)),
+    maxIntelligenceSecondPassCallsPerDay: Math.max(0, numberSetting(env.MAX_INTELLIGENCE_SECOND_PASS_CALLS_PER_DAY, 800)),
     imageModel: env.AI_IMAGE_MODEL,
     aiDailyNeuronBudget: numberSetting(env.AI_DAILY_NEURON_BUDGET, 8_000),
     maxStage1CallsPerDay: numberSetting(env.MAX_STAGE1_CALLS_PER_DAY, 250),
