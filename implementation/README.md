@@ -1,6 +1,6 @@
 # Radar Implementation Playbook
 
-This folder contains the implementation plan for Radar as a sequence of coding-agent prompts. For this repository, `Overview/Cloudflare-Free-Adaptation.md` is the controlling architecture decision: public Telegram polling replaces the VPS/Telethon collector.
+This folder contains the implementation plan for Radar. V8 is the controlling architecture: public Telegram polling replaces the VPS/Telethon collector, and batched Nebula reasoning replaces semantic embeddings and vector search.
 
 Run the phases **in order**. Each phase assumes the previous phase is complete and passing its acceptance criteria.
 
@@ -9,7 +9,7 @@ Run the phases **in order**. Each phase assumes the previous phase is complete a
 1. [`01-foundation-and-contracts.md`](./01-foundation-and-contracts.md)
 2. [`02-telegram-collector-and-ingestion.md`](./02-telegram-collector-and-ingestion.md)
 3. [`03-source-registry-normalization-and-backfill.md`](./03-source-registry-normalization-and-backfill.md)
-4. [`04-embeddings-deduplication-and-event-clustering.md`](./04-embeddings-deduplication-and-event-clustering.md)
+4. [`04-nebula-batch-intelligence.md`](./04-nebula-batch-intelligence.md)
 5. [`05-source-independence-and-verification.md`](./05-source-independence-and-verification.md)
 6. [`06-importance-and-editorial-engine.md`](./06-importance-and-editorial-engine.md)
 7. [`07-story-covers-and-telegram-publisher.md`](./07-story-covers-and-telegram-publisher.md)
@@ -24,6 +24,7 @@ The coding agent must follow these rules throughout the project:
 - Do not implement future phases early unless a minimal interface/stub is required by the current phase.
 - Prefer simple, testable components over premature abstraction.
 - Keep Telegram public-page parsing isolated from the Cloudflare processing modules.
+- Radar does not use embeddings, Vectorize, vector similarity, or semantic-neighbor retrieval. Semantic event understanding is performed by bounded Nebula LLM batches.
 - Do not reintroduce Telethon, a Telegram user session, or a VPS without an explicit architecture decision.
 - Do not add R2 for covers; the current architecture generates optional covers in memory and uploads them directly to Telegram. If cover generation or image processing fails, publish the story as text-only without a fallback graphic.
 - Keep secrets out of Git.
@@ -33,6 +34,7 @@ The coding agent must follow these rules throughout the project:
 - Add migrations rather than editing production database state manually.
 - Add tests for important deterministic logic.
 - Add structured logs around external boundaries and failure paths.
+- Never let the LLM invent source confirmations, event IDs, or authoritative verification states.
 - Do not silently swallow malformed AI output, network failures or database errors.
 - Update documentation when configuration, schemas or deployment steps change.
 - Do not add a large frontend/dashboard unless a phase explicitly asks for one.

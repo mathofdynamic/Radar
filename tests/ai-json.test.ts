@@ -7,6 +7,16 @@ describe("structured AI parsing", () => {
       .toEqual({ publish_recommendation: "PUBLISH", reason: "important" });
   });
 
+  it("accepts nested result responses from compatible gateways", () => {
+    expect(parseStructuredAiResult({ result: { response: { status: "MONITOR" } } }))
+      .toEqual({ status: "MONITOR" });
+  });
+
+  it("accepts OpenAI-compatible chat completion content", () => {
+    expect(parseStructuredAiResult({ choices: [{ message: { content: "{\"status\":\"MONITOR\"}" } }] }))
+      .toEqual({ status: "MONITOR" });
+  });
+
   it("accepts fenced JSON from non-compliant model output", () => {
     expect(parseStructuredAiResult({ response: "```json\n{\"title\":\"خبر مهم\"}\n```" }))
       .toEqual({ title: "خبر مهم" });

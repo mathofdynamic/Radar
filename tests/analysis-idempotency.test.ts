@@ -2,140 +2,62 @@ import { readFileSync } from "node:fs";
 import { resolve } from "node:path";
 import { DatabaseSync } from "node:sqlite";
 import { describe, expect, it } from "vitest";
-import { getEmbeddingCheckpoint, saveEmbeddingCheckpoint } from "../src/db";
 import {
-  isDeferredCheckpointForCurrentUtcDate,
-  isReusableEmbeddingCheckpoint,
+  floorFiveMinuteWindow,
   isStaleAnalysisLease,
-  shouldApplyEventVersion,
+  normalizeLegacyAnalysisStatus,
   shouldSkipAnalyzedPost
 } from "../src/intelligence/analysis-state";
-import type { EmbeddingCheckpointRow } from "../src/types";
+import { getEventByOriginatingRawPostId } from "../src/db";
 
-class CheckpointDb {
-  private checkpoint: EmbeddingCheckpointRow | null = null;
-
-  prepare(sql: string): D1PreparedStatement {
-    const database = this;
-    return {
-      bind(...args: unknown[]) {
+describe("V8 analysis idempotency", () => {
+  it("recovers an event row left behind before its source evidence was attached", async () => {
+    const event = { id: 42, originating_raw_post_id: 7 };
+    const db = {
+      prepare(sql: string) {
+        expect(sql).toContain("originating_raw_post_id");
         return {
-          async first<T>(): Promise<T | null> {
-            if (!sql.includes("FROM embedding_checkpoints")) return null;
-            const [rawPostId, contentHash, embeddingModel] = args as [number, string, string];
-            const row = database.checkpoint;
-            return row
-              && row.raw_post_id === rawPostId
-              && row.content_hash === contentHash
-              && row.embedding_model === embeddingModel
-              ? row as T
-              : null;
-          },
-          async run(): Promise<D1Result<unknown>> {
-            if (sql.includes("INSERT INTO embedding_checkpoints")) {
-              const [rawPostId, contentHash, embeddingModel, vectorJson, state, embeddedAt, updatedAt] = args as [number, string, string, string | null, "ready" | "deferred", string | null, string];
-              database.checkpoint = { raw_post_id: rawPostId, content_hash: contentHash, embedding_model: embeddingModel, vector_json: vectorJson, embedding_state: state, embedded_at: embeddedAt, updated_at: updatedAt };
-              return { success: true, meta: { changes: 1 } } as D1Result<unknown>;
-            }
-            return { success: true, meta: { changes: 0 } } as D1Result<unknown>;
+          bind(rawPostId: number) {
+            expect(rawPostId).toBe(7);
+            return { first: async () => event };
           }
-        } as unknown as D1PreparedStatement;
+        };
       }
-    } as unknown as D1PreparedStatement;
-  }
-}
+    } as unknown as D1Database;
 
-describe("V6 analysis idempotency", () => {
-  it("stores one durable embedding and reuses it after a downstream retry", async () => {
-    const db = new CheckpointDb() as unknown as D1Database;
-    const contentHash = "content-a";
-    const model = "@cf/baai/bge-m3";
-    let embeddingCalls = 0;
-
-    const prepareOrReuse = async (): Promise<number[]> => {
-      const checkpoint = await getEmbeddingCheckpoint(db, 7, contentHash, model);
-      if (isReusableEmbeddingCheckpoint(checkpoint, contentHash, model)) return JSON.parse(checkpoint.vector_json as string) as number[];
-      embeddingCalls += 1;
-      const vector = [0.1, 0.2, 0.3];
-      await saveEmbeddingCheckpoint(db, {
-        raw_post_id: 7,
-        content_hash: contentHash,
-        embedding_model: model,
-        vector_json: JSON.stringify(vector),
-        embedding_state: "ready",
-        embedded_at: new Date().toISOString()
-      });
-      return vector;
-    };
-
-    expect(await prepareOrReuse()).toEqual([0.1, 0.2, 0.3]);
-    // Simulate Vectorize/event finalization failing before the Queue job ends.
-    expect(await prepareOrReuse()).toEqual([0.1, 0.2, 0.3]);
-    expect(embeddingCalls).toBe(1);
+    await expect(getEventByOriginatingRawPostId(db, 7)).resolves.toEqual(event);
   });
 
-  it("invalidates a checkpoint when normalized content or model changes", async () => {
-    const checkpoint: EmbeddingCheckpointRow = {
-      raw_post_id: 7,
-      content_hash: "content-a",
-      embedding_model: "model-a",
-      vector_json: "[0.1,0.2]",
-      embedding_state: "ready",
-      embedded_at: new Date().toISOString(),
-      updated_at: new Date().toISOString()
-    };
-    expect(isReusableEmbeddingCheckpoint(checkpoint, "content-a", "model-a")).toBe(true);
-    expect(isReusableEmbeddingCheckpoint(checkpoint, "content-b", "model-a")).toBe(false);
-    expect(isReusableEmbeddingCheckpoint(checkpoint, "content-a", "model-b")).toBe(false);
+  it("normalizes unfinished V6 states into recoverable pending work", () => {
+    expect(normalizeLegacyAnalysisStatus("embedding")).toBe("pending");
+    expect(normalizeLegacyAnalysisStatus("embedded")).toBe("pending");
+    expect(normalizeLegacyAnalysisStatus("processing")).toBe("pending");
+    expect(normalizeLegacyAnalysisStatus("analyzed")).toBe("analyzed");
   });
 
-  it("does not reattempt a deferred embedding in the same UTC day", () => {
-    const checkpoint: EmbeddingCheckpointRow = {
-      raw_post_id: 7,
-      content_hash: "content-a",
-      embedding_model: "model-a",
-      vector_json: null,
-      embedding_state: "deferred",
-      embedded_at: null,
-      updated_at: "2026-08-11T06:20:49.057Z"
-    };
-
-    expect(isDeferredCheckpointForCurrentUtcDate(checkpoint, "content-a", "model-a", "2026-08-11T12:00:00.000Z")).toBe(true);
-    expect(isDeferredCheckpointForCurrentUtcDate(checkpoint, "content-a", "model-a", "2026-08-12T00:00:00.000Z")).toBe(false);
-    expect(isDeferredCheckpointForCurrentUtcDate(checkpoint, "content-b", "model-a", "2026-08-11T12:00:00.000Z")).toBe(false);
-  });
-
-  it("applies event version advancement once even when evidence insertion is retried", () => {
-    let eventVersion = 4;
-    let eventSourceRows = 0;
-    let versionMarker = 0;
-    const finalizeEvidence = () => {
-      if (eventSourceRows === 0) eventSourceRows = 1;
-      if (shouldApplyEventVersion(versionMarker)) {
-        eventVersion += 1;
-        versionMarker = 2;
-      }
-    };
-
-    finalizeEvidence();
-    finalizeEvidence();
-    expect(eventSourceRows).toBe(1);
-    expect(eventVersion).toBe(5);
-    expect(versionMarker).toBe(2);
-  });
-
-  it("no-ops already analyzed posts and only recovers stale leases", () => {
+  it("keeps analyzed and noise rows terminal", () => {
     expect(shouldSkipAnalyzedPost("analyzed")).toBe(true);
-    expect(shouldSkipAnalyzedPost("processing")).toBe(false);
+    expect(shouldSkipAnalyzedPost("noise")).toBe(true);
+    expect(shouldSkipAnalyzedPost("analyzing")).toBe(false);
+  });
+
+  it("only recovers stale leases", () => {
     const now = "2026-08-11T12:00:00.000Z";
     expect(isStaleAnalysisLease("2026-08-11T11:55:00.000Z", now)).toBe(false);
     expect(isStaleAnalysisLease("2026-08-11T11:40:00.000Z", now)).toBe(true);
     expect(isStaleAnalysisLease(null, now)).toBe(true);
   });
+
+  it("creates deterministic five-minute windows", () => {
+    expect(floorFiveMinuteWindow("2026-08-14T00:07:32.000Z")).toEqual({
+      start: "2026-08-14T00:00:00.000Z",
+      end: "2026-08-14T00:05:00.000Z"
+    });
+  });
 });
 
-describe("V6.1 event-origin conflict target", () => {
-  it("reproduces the partial-index failure and makes the exact insert idempotent after migration", () => {
+describe("V6.1 event-origin conflict target retained by V8", () => {
+  it("keeps event creation and evidence insertion idempotent", () => {
     const db = new DatabaseSync(":memory:");
     try {
       db.exec(`
@@ -170,24 +92,41 @@ describe("V6.1 event-origin conflict target", () => {
         .toThrow(/ON CONFLICT clause does not match any PRIMARY KEY or UNIQUE constraint/);
 
       db.exec(readFileSync(resolve(process.cwd(), "migrations/0007_fix_event_origin_unique_index.sql"), "utf8"));
-
       const insert = db.prepare(insertSql);
       insert.run("fact", "IRAN", "now", "now", 7, "now", "now");
       insert.run("changed text", "IRAN", "later", "later", 7, "later", "later");
 
-      const recovered = db.prepare("SELECT id, event_version FROM events WHERE originating_raw_post_id = ?").get(7) as { id: number; event_version: number };
-      expect(recovered.id).toBe(1);
-      expect(recovered.event_version).toBe(1);
       expect(db.prepare("SELECT COUNT(*) AS count FROM events WHERE originating_raw_post_id = ?").get(7)).toMatchObject({ count: 1 });
-
       const evidence = db.prepare("INSERT INTO event_sources(event_id, raw_post_id) VALUES (?, ?) ON CONFLICT(event_id, raw_post_id) DO NOTHING");
-      evidence.run(recovered.id, 7);
-      evidence.run(recovered.id, 7);
-      expect(db.prepare("SELECT COUNT(*) AS count FROM event_sources WHERE event_id = ? AND raw_post_id = ?").get(recovered.id, 7)).toMatchObject({ count: 1 });
+      evidence.run(1, 7);
+      evidence.run(1, 7);
+      expect(db.prepare("SELECT COUNT(*) AS count FROM event_sources WHERE event_id = ? AND raw_post_id = ?").get(1, 7)).toMatchObject({ count: 1 });
+    } finally {
+      db.close();
+    }
+  });
+});
 
-      insert.run("null one", "IRAN", "n1", "n1", null, "n1", "n1");
-      insert.run("null two", "IRAN", "n2", "n2", null, "n2", "n2");
-      expect(db.prepare("SELECT COUNT(*) AS count FROM events WHERE originating_raw_post_id IS NULL").get()).toMatchObject({ count: 2 });
+describe("V8 migration", () => {
+  it("drops obsolete checkpoints, requeues unfinished legacy rows, and creates batch audit tables", () => {
+    const db = new DatabaseSync(":memory:");
+    try {
+      const migrations = ["0001_initial.sql", "0002_rename_cover_reference.sql", "0003_event_publication_locks.sql", "0004_runtime_settings.sql", "0005_ai_runtime_safety.sql", "0006_analysis_idempotency.sql", "0007_fix_event_origin_unique_index.sql"];
+      for (const migration of migrations) db.exec(readFileSync(resolve(process.cwd(), "migrations", migration), "utf8"));
+      db.prepare(
+        `INSERT INTO sources(source_key, name, source_type, telegram_username, public_url, language, category, role, created_at, updated_at)
+         VALUES ('test', 'Test', 'telegram', 'test', 'https://t.me/test', 'fa', 'IRAN', 'specialist', 'now', 'now')`
+      ).run();
+      db.prepare(
+        `INSERT INTO raw_posts(source_id, telegram_message_id, canonical_url, update_type, observed_at, original_text, content_hash, processing_status, created_at, updated_at)
+         VALUES (1, 1, 'https://t.me/test/1', 'create', 'now', 'legacy', 'hash', 'embedded', 'now', 'now')`
+      ).run();
+
+      db.exec(readFileSync(resolve(process.cwd(), "migrations/0008_remove_embedding_pipeline.sql"), "utf8"));
+      expect(db.prepare("SELECT processing_status FROM raw_posts WHERE id = 1").get()).toMatchObject({ processing_status: "pending" });
+      expect(db.prepare("SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'embedding_checkpoints'").get()).toBeUndefined();
+      expect(db.prepare("SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'intelligence_batches'").get()).toMatchObject({ name: "intelligence_batches" });
+      expect(db.prepare("SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'intelligence_batch_items'").get()).toMatchObject({ name: "intelligence_batch_items" });
     } finally {
       db.close();
     }

@@ -1,52 +1,62 @@
 # Radar
 
-Radar is a Cloudflare-only Persian news-intelligence pipeline. It polls public Telegram channel pages, turns repeated reports into traceable events, estimates independent confirmation, scores editorial importance, generates concise Persian stories and covers, and publishes selected stories to the Radar Telegram channel.
+Radar is a Cloudflare-only Persian news-intelligence pipeline. It polls public Telegram channel pages, persists raw reports in D1, forms events with bounded batched LLM reasoning through Nebula, verifies source independence deterministically, scores importance, and keeps editorial/publishing controls separate.
 
-This implementation intentionally uses scheduled polling of `https://t.me/s/{username}`. It does not use Telethon, a Telegram user session, or a VPS. The tradeoff is lower freshness and incomplete edit/delete/forward metadata compared with a persistent MTProto collector.
+Radar does not use embeddings or vector search. Semantic event understanding is performed by batched LLM reasoning through Nebula.
 
 ## Architecture
 
 ```text
-Cloudflare Cron (tiny: enqueue one tick only)
+Cloudflare Cron every minute
   -> radar-poll Queue
-  -> poll-cycle Queue consumer
-       -> select bounded due-source batch from D1
-       -> fetch + parse Telegram public pages
-       -> persist raw posts
-       -> radar-event-analysis prepare/embed job per raw post
-       -> D1 embedding checkpoint
-       -> radar-event-analysis finalize job per raw post
-       -> Vectorize + event clustering + verification
-       -> editorial judgment
-       -> publish Queue only for approved stories
-
-Fallback queues are retained for failed individual stages:
-  radar-raw-ingest
-  radar-event-analysis
-  radar-editorial
+  -> bounded due-source polling
+  -> radar-raw-ingest Queue
+  -> raw_posts in D1
+  -> deterministic normalization/noise filtering
+  -> durable five-minute intelligence_batch job
+  -> Nebula /v1/chat/completions, intelligence model=@cf/zai-org/glm-4.7-flash
+  -> validated event grouping decisions
+  -> deterministic event/source relationships and origin groups
+  -> deterministic verification and importance scoring
+  -> radar-editorial Queue
+  -> Nebula Stage-1 editorial judgment
+  -> publishing gate (disabled in this branch)
+  -> Nebula Stage-2 story generation when publishing is enabled later
+  -> Workers AI image generation for optional covers only
 ```
 
-The Cron handler deliberately performs no D1 queries, Telegram fetches, HTML parsing, hashing, AI work, or recovery scans. Those operations run inside the `radar-poll` Queue consumer, where the Free-plan CPU constraint is substantially less restrictive.
+The Cron handler only enqueues a poll tick. Polling, D1 work, recovery, and AI calls run in Queue consumers. The existing one-minute polling cadence, `POLL_BATCH_SIZE=5`, and `POLL_INTERVAL_SECONDS=300` remain unchanged.
 
-To stay inside the Workers Free Queues allowance, the normal path does **not** enqueue one message per source. One Cron tick creates one `poll_cycle` message; that consumer handles a bounded set of due sources synchronously. Analysis itself is intentionally one raw post per Queue work unit: a prepare/embed job writes a durable checkpoint, then a finalize job performs the heavier Vectorize and D1 work.
+## V8 intelligence batches
 
-### V6 analysis retry safety
+New or recovered reports remain in generic `pending`, `queued`, `analyzing`, `analyzed`, or `noise` states. A durable batch claims a bounded set using D1 leases. The default limit is 32 reports and a 60,000-character payload, with an 1,800-character report-text limit and up to 40 recent active-event summaries. If work remains, continuation Queue jobs process it in bounded steps; raw report text is never placed in Queue payloads.
 
-Before V6, `analyzeRawPost()` generated an embedding and then performed Vectorize, duplicate detection, event matching, verification, and scoring in the same retryable function. A CPU termination after the AI call caused the Queue retry to start at the embedding call again. That was the cause of repeated embedding charges and `processing` rows that could not make progress.
+Nebula receives compact report metadata and recent candidate events. It may return `MATCH_EXISTING_EVENT`, `NEW_EVENT`, `DUPLICATE`, `UPDATE_EXISTING_EVENT`, `NOISE`, or `UNCERTAIN`. Strict validation rejects unknown IDs, invalid categories/confidence, missing coverage, duplicate assignments, contradictory assignments, and fabricated event IDs. A low-confidence or uncertain decision receives one focused ambiguity pass. If it remains uncertain, Radar keeps a separate monitorable event rather than forcing a merge.
 
-V6 uses this durable sequence:
+Nebula never supplies authoritative confirmation counts. Radar calculates independent source/origin groups from `event_sources`, retained source relationships, and deterministic copied-source detection. D1 remains authoritative for raw posts, events, evidence, verification, scoring, and idempotency.
+
+## Retry and backlog safety
+
+`intelligence_batches` and `intelligence_batch_items` record batch status, leases, attempts, provider/model telemetry, token usage, decisions, and application state. Queue retries may repeat an API request, but conflict-safe event creation, `event_sources(event_id, raw_post_id)`, `originating_raw_post_id`, and `event_version_applied` prevent duplicate event/evidence/version application.
+
+Migration `0008_remove_embedding_pipeline.sql` drops the obsolete `embedding_checkpoints` table and requeues unfinished legacy `processing`, `embedding`, and `embedded` rows. It does not delete historical raw posts, events, or evidence and does not drop generic V6 lease/hash columns. Recovery is bounded and prioritizes fresh pending reports before historical backlog.
+
+The old `radar-events` Vectorize resource is not referenced or destroyed by this repository. It is an orphaned infrastructure resource that can be deleted manually after review.
+
+## Nebula configuration
+
+The Worker uses:
 
 ```text
-raw post
-  -> analysis_prepare / normalize + noise handling
-  -> embedding_checkpoints(raw_post_id, normalized content hash, model)
-  -> analysis_finalize / Vectorize + clustering + verification + scoring
-  -> editorial
+NEBULA_BASE_URL=https://nebula-free-llm.nebula-ai-company.workers.dev/v1
+NEBULA_API_KEY=<Worker secret>
+NEBULA_INTELLIGENCE_MODEL=@cf/zai-org/glm-4.7-flash
+NEBULA_EDITORIAL_MODEL=auto
+NEBULA_INTELLIGENCE_TIMEOUT_MS=95000
+NEBULA_EDITORIAL_TIMEOUT_MS=25000
 ```
 
-The checkpoint is written immediately after a successful Workers AI response and before Vectorize. A retry with the same normalized content and embedding model reuses it without reserving another embedding call. Content or model changes invalidate the checkpoint. A completed raw post is marked `analyzed`; its temporary vector payload is then removed, so cleanup cannot make an unfinished retry pay again.
-
-Analysis leases use a ten-minute stale threshold. The poll consumer requeues at most one stale analysis row per cycle, which recovers old `pending`/`processing` work without synchronously flooding a Queue or resetting fresh work.
+`NEBULA_MODEL` and `NEBULA_TIMEOUT_MS` remain legacy compatibility fallbacks for editorial work. The API key is never committed. Nebula owns provider routing and fallback. Radar does not store provider credentials or rotate provider keys. Workers AI remains only for optional image cover generation.
 
 ## Local setup
 
@@ -58,70 +68,37 @@ npm run types
 npm run typecheck
 npm test
 npm run deploy:dry
+git diff --check
 ```
 
-For local secrets:
-
-```powershell
-Copy-Item .dev.vars.example .dev.vars
-```
-
-The bot token must be rotated in BotFather before it is placed in `.dev.vars` or Cloudflare secrets. The token previously pasted into the conversation is not used.
-
-Run the Worker locally with `npm run dev`. Trigger the scheduled event with the Wrangler scheduled-event route shown by the current Wrangler output; the scheduled handler itself only enqueues a `poll_cycle` job.
+Copy `.dev.vars.example` to `.dev.vars` for local secrets, then add `NEBULA_API_KEY` locally. Never commit the value. Live D1, Queue, Telegram, and Nebula smoke tests require credentials and are not part of the deterministic unit suite.
 
 ## Cloudflare resources
 
-The target account is `mathofdynamic2`. Create the following resources before production deployment:
+The Worker uses:
 
-- D1: `radar-db`
-- Queues: `radar-poll`, `radar-raw-ingest`, `radar-event-analysis`, `radar-editorial`, `radar-publish`, `radar-dead-letter`
-- Vectorize index: `radar-events`
+- D1: `radar-db`;
+- Queues: `radar-poll`, `radar-raw-ingest`, `radar-event-analysis`, `radar-editorial`, `radar-publish`, `radar-dead-letter`;
+- Workers AI binding `AI` for covers only.
 
-If upgrading an existing deployment, create the new poll queue before deploying this branch:
+There is no `EVENT_INDEX` binding and no Radar Vectorize dependency. Do not destroy the existing `radar-events` index automatically.
 
-```powershell
-npx wrangler queues create radar-poll
-```
+Publishing remains disabled by both `PUBLISH_ENABLED=false` and the D1 `publishing_enabled=false` setting during V8 review.
 
-The `radar-poll` consumer is configured with `max_batch_size=1` and `max_concurrency=1` so overlapping poll cycles do not repeatedly select the same due sources when a backlog forms.
+## Source registry and polling
 
-After creating D1, replace the placeholder `database_id` in `wrangler.jsonc`, apply migrations, and run `npm run types`.
-
-Set the replacement token securely:
-
-```powershell
-wrangler secret put TELEGRAM_BOT_TOKEN
-wrangler secret put RADAR_ADMIN_KEY
-wrangler secret put RADAR_DASHBOARD_USERNAME
-wrangler secret put RADAR_DASHBOARD_PASSWORD
-```
-
-The protected operations console is available at `/admin`. It uses an HttpOnly, Secure, SameSite session cookie signed with the dashboard password and refreshes its D1-backed snapshot every 60 seconds. Never commit or paste the dashboard password into source control or chat.
-
-Publishing is disabled by default in new environments. Set `PUBLISH_ENABLED` to `true` only after the bot is an administrator of the destination channel with posting permission and the smoke checks pass.
-
-## Free-plan scheduling budget
-
-With a one-minute Cron, `radar-poll` receives at most 1,440 normal poll-cycle messages per UTC day. A successfully delivered Queue message normally incurs write + read + delete operations, so the scheduler consumes roughly 4,320 Queue operations/day before retries. At approximately 500 raw posts/day, V6 adds up to roughly 1,000 analysis messages/day (prepare plus finalize) and up to 500 editorial messages when every post becomes a candidate. That is approximately 8,820 Queue operations/day before retries or fallback messages; noise filtering and below-threshold candidates reduce the normal editorial portion. This remains a tight but plausible Free-plan budget, so retries must remain bounded and the dashboard should be monitored for backlog growth.
-
-The V5 polling capacity is calibrated for freshness: five due sources per minute provide approximately 300 source polls/hour. With 23 active sources and a five-minute target interval, the expected demand is approximately 276 polls/hour. This intentionally balances source freshness against Cloudflare Free per-invocation limits without increasing Queue consumer concurrency.
-
-Do not change the architecture to enqueue one polling message per source every few minutes: with 20+ sources that can exceed the Free Queues operation allowance even before news-processing messages are counted.
-
-## Source registry
-
-The initial seed is in `seeds/sources.json`. Every candidate must pass a public-page fetch smoke test before activation. Source relationships and trust metadata are editorial configuration, not automatically learned truth.
+The initial source seed is `seeds/sources.json`. Sources are polled through `https://t.me/s/{username}`. The idempotency key is `(source_id, telegram_message_id)`, and original text/raw metadata are retained before normalization. Source identity, polling health, origin relationships, and confirmation grouping are deterministic configuration/runtime concerns, not LLM-authoritative facts.
 
 ## Validation
 
-The test suite covers public Telegram parsing, idempotent raw-post updates, normalization, clustering, verification, scoring, story constraints, AI image-format detection, publication formatting, and update classification. Live Telegram, Workers AI, Vectorize, and Cloudflare Queue behavior require deployment smoke tests and credentials.
+The unit suite covers parsing, normalization, generic lease recovery, event-origin idempotency, structured Nebula output validation, batch grouping, existing-event matching, duplicate handling, ambiguity resolution, editorial gates, story language constraints, cover format handling, and publication safety. A production-derived Nebula backtest is required before deployment; it must remain read-only and must report agreements, disagreements, false-merge candidates, false-split candidates, and uncertainty.
 
-After deployment, verify both of these separately:
+Run it only with a locally supplied `NEBULA_API_KEY`:
 
-1. Cron executions finish without `exceededCpu` and only produce the poll Queue write.
-2. `radar-poll` consumer executions perform the actual polling and processing successfully.
+```powershell
+npm run backtest
+```
 
-## Scope note
+The script uses SELECT-only remote D1 queries and exits blocked rather than fabricating results when the Worker secret is unavailable.
 
-The original project documents describe a Telethon collector. `Overview/Cloudflare-Free-Adaptation.md` is the current architecture decision for this repository and supersedes the VPS/Telethon portions of the original phase prompts.
+The public health endpoint is `GET /health`. The authenticated operations endpoint is `GET /ops/summary`.

@@ -392,7 +392,7 @@ const DASHBOARD_HTML = String.raw`<!doctype html>
         return labels[value] || value || "—";
       }
       function translateStage(value) {
-        var labels = { embedding: "بردارسازی", stage1: "تحلیل اولیه", stage2: "بررسی تحریریه", cover: "تصویر خبری", editorial: "تحریریه" };
+        var labels = { intelligence: "درک رویداد", intelligence_second_pass: "رفع ابهام", stage1: "تحلیل اولیه", stage2: "بررسی تحریریه", cover: "تصویر خبری", editorial: "تحریریه" };
         return labels[value] || value || "—";
       }
       function translateCategory(value) {

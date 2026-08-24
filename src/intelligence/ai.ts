@@ -1,54 +1,295 @@
+import { z, type ZodType } from "zod";
+import { readBoundedText } from "../crypto";
 import { runtimeConfig } from "../config";
-import { reserveAiCall } from "../db";
+import { intelligenceBatchJsonSchema } from "../contracts";
+import { incrementCounter, reserveNebulaCall, reserveWorkersAiCall } from "../db";
 import type { JsonObject } from "../types";
 
 export type GeneratedImageMimeType = "image/png" | "image/jpeg";
+export type NebulaStage =
+  | "intelligence"
+  | "intelligence_second_pass"
+  | "intelligence_proposal"
+  | "intelligence_pair"
+  | "stage1"
+  | "stage2";
 
 export interface GeneratedImage {
   bytes: ArrayBuffer;
   mimeType: GeneratedImageMimeType;
 }
 
-export async function generateEmbedding(env: Env, text: string): Promise<number[] | null> {
-  const config = runtimeConfig(env);
-  const allowed = await reserveAiCall(env.DB, "embedding", config.maxEmbeddingsPerDay, 12, config.aiDailyNeuronBudget);
-  if (!allowed) return null;
-  try {
-    const result = await env.AI.run(config.embeddingModel, { text: [text.slice(0, 4_000)] });
-    if (isNumberArray(result)) return result;
-    if (isEmbeddingResult(result)) return result.data[0] ?? null;
-    return null;
-  } catch (error) {
-    console.error(JSON.stringify({ event: "ai_embedding_failed", error: error instanceof Error ? error.message : "unknown" }));
-    return null;
+export interface NebulaUsage {
+  requestedModel: string;
+  model: string;
+  provider: string | null;
+  routedModel: string | null;
+  fallbackAttempts: number;
+  requestId: string | null;
+  status: number | null;
+  latencyMs: number;
+  promptTokens: number;
+  completionTokens: number;
+  logicalAttempt: number;
+  logicalRetry: boolean;
+  attemptStatuses: Array<number | null>;
+}
+
+export interface NebulaJsonResult<T> {
+  data: T;
+  usage: NebulaUsage;
+}
+
+export class NebulaError extends Error {
+  readonly status: number | null;
+  readonly telemetry: NebulaTelemetry | null;
+  readonly retryable: boolean;
+
+  constructor(message: string, status: number | null = null, telemetry: NebulaTelemetry | null = null, retryable = false) {
+    super(message);
+    this.name = "NebulaError";
+    this.status = status;
+    this.telemetry = telemetry;
+    this.retryable = retryable;
   }
 }
 
-export async function generateStructuredText(env: Env, prompt: string, stage: "stage1" | "stage2"): Promise<JsonObject | null> {
+export interface NebulaTelemetry {
+  requestedModel: string;
+  provider: string | null;
+  routedModel: string | null;
+  fallbackAttempts: number;
+  requestId: string | null;
+  status: number | null;
+  latencyMs: number;
+  logicalAttempt: number;
+  logicalRetry: boolean;
+  attemptStatuses: Array<number | null>;
+}
+
+export interface NebulaRequestOptions {
+  responseSchema?: Record<string, unknown>;
+  responseSchemaName?: string;
+  chatTemplateKwargs?: Record<string, unknown>;
+  completionParameter?: "max_tokens" | "max_completion_tokens";
+}
+
+const nebulaJsonSchema = z.record(z.unknown());
+
+export async function generateNebulaJson<T>(
+  env: Env,
+  stage: NebulaStage,
+  systemPrompt: string,
+  userPrompt: string,
+  schema: ZodType<T>,
+  maxTokens = 1_600,
+  options: NebulaRequestOptions = {}
+): Promise<NebulaJsonResult<T> | null> {
   const config = runtimeConfig(env);
-  const maxCalls = stage === "stage1" ? config.maxStage1CallsPerDay : config.maxStage2CallsPerDay;
-  const allowed = await reserveAiCall(env.DB, stage, maxCalls, stage === "stage1" ? 40 : 120, config.aiDailyNeuronBudget);
-  if (!allowed) return null;
+  const apiKey = env.NEBULA_API_KEY?.trim();
+  if (!apiKey) throw new NebulaError("nebula_api_key_missing");
+
+  const isIntelligence = stage === "intelligence"
+    || stage === "intelligence_second_pass"
+    || stage === "intelligence_proposal"
+    || stage === "intelligence_pair";
+  const requestedModel = isIntelligence ? config.nebulaIntelligenceModel : config.nebulaEditorialModel;
+  const timeoutMs = isIntelligence ? config.nebulaIntelligenceTimeoutMs : config.nebulaEditorialTimeoutMs;
+
+  const maxCalls = stage === "intelligence" || stage === "intelligence_proposal"
+    ? config.maxIntelligenceBatchesPerDay
+    : stage === "intelligence_second_pass" || stage === "intelligence_pair"
+      ? config.maxIntelligenceSecondPassCallsPerDay
+      : stage === "stage1"
+        ? config.maxStage1CallsPerDay
+        : config.maxStage2CallsPerDay;
+  const maxLogicalAttempts = isIntelligence ? 2 : 1;
+  const attemptStatuses: Array<number | null> = [];
+  for (let logicalAttempt = 1; logicalAttempt <= maxLogicalAttempts; logicalAttempt += 1) {
+    const reserved = await reserveNebulaCall(env.DB, stage, maxCalls);
+    if (!reserved) {
+      if (logicalAttempt > 1) await safeIncrementCounter(env.DB, "nebula_logical_retry_failures");
+      throw new NebulaError("nebula_daily_budget_exhausted");
+    }
+    await safeIncrementCounter(env.DB, "intelligence_ai_calls");
+    if (stage === "intelligence_second_pass") await safeIncrementCounter(env.DB, "intelligence_second_pass_calls");
+    if (stage === "intelligence_proposal") await safeIncrementCounter(env.DB, "v8_current_window_proposal_calls");
+    if (stage === "intelligence_pair") await safeIncrementCounter(env.DB, "v8_current_window_pair_calls");
+
+    const controller = new AbortController();
+    const timeoutId = setTimeout(() => controller.abort(), timeoutMs);
+    const startedAt = Date.now();
+    let telemetry: NebulaTelemetry = {
+      requestedModel,
+      provider: null,
+      routedModel: null,
+      fallbackAttempts: 0,
+      requestId: null,
+      status: null,
+      latencyMs: 0,
+      logicalAttempt,
+      logicalRetry: logicalAttempt > 1,
+      attemptStatuses: []
+    };
+    try {
+      const response = await fetch(`${config.nebulaBaseUrl}/chat/completions`, {
+        method: "POST",
+        headers: {
+          accept: "application/json",
+          "content-type": "application/json",
+          authorization: `Bearer ${apiKey}`
+        },
+        body: JSON.stringify({
+          model: requestedModel,
+          messages: [
+            { role: "system", content: systemPrompt },
+            { role: "user", content: userPrompt }
+          ],
+          response_format: isIntelligence
+             ? {
+                 type: "json_schema",
+                 json_schema: {
+                  name: options.responseSchemaName ?? "radar_intelligence_batch",
+                  strict: true,
+                  schema: options.responseSchema ?? intelligenceBatchJsonSchema
+                }
+              }
+            : { type: "json_object" },
+          temperature: 0.1,
+          ...(options.completionParameter === "max_completion_tokens"
+            ? { max_completion_tokens: maxTokens }
+            : { max_tokens: maxTokens }),
+          ...(options.chatTemplateKwargs ? { chat_template_kwargs: options.chatTemplateKwargs } : {})
+        }),
+        signal: controller.signal
+      });
+      telemetry = readNebulaTelemetry(response, requestedModel, startedAt, logicalAttempt);
+      attemptStatuses.push(response.status);
+      const responseText = await readBoundedText(response, 2_000_000);
+      if (!response.ok) {
+        throw new NebulaError(
+          `nebula_http_${response.status}`,
+          response.status,
+          telemetry,
+          isTransientGatewayStatus(response.status)
+        );
+      }
+
+      let body: unknown;
+      try {
+        body = JSON.parse(responseText) as unknown;
+      } catch {
+        throw new NebulaError("nebula_response_not_json", response.status, telemetry);
+      }
+      const parsed = schema.safeParse(parseStructuredAiResult(body));
+      if (!parsed.success) throw new NebulaError(`nebula_schema_invalid:${parsed.error.issues[0]?.message ?? "unknown"}`, response.status, telemetry);
+
+      const responseObject = isJsonObject(body) ? body : {};
+      const usage = isJsonObject(responseObject.usage) ? responseObject.usage : {};
+      const responseModel = getString(responseObject.model);
+      if (logicalAttempt > 1) await safeIncrementCounter(env.DB, "nebula_logical_retry_successes");
+      return {
+        data: parsed.data,
+        usage: {
+          ...telemetry,
+          model: responseModel ?? telemetry.routedModel ?? requestedModel,
+          promptTokens: getNumber(usage.prompt_tokens),
+          completionTokens: getNumber(usage.completion_tokens),
+          attemptStatuses: [...attemptStatuses]
+        }
+      };
+    } catch (error) {
+      if (attemptStatuses.length < logicalAttempt) attemptStatuses.push(telemetry.status);
+      await safeIncrementCounter(env.DB, "intelligence_ai_failures");
+      const normalized = error instanceof NebulaError
+        ? new NebulaError(error.message, error.status, error.telemetry ? { ...error.telemetry, attemptStatuses: [...attemptStatuses] } : { ...telemetry, attemptStatuses: [...attemptStatuses] }, error.retryable)
+        : new NebulaError(
+          error instanceof Error ? error.message : "nebula_request_failed",
+          null,
+          { ...telemetry, latencyMs: Date.now() - startedAt, attemptStatuses: [...attemptStatuses] },
+          isTransientTransportError(error)
+        );
+      if (logicalAttempt < maxLogicalAttempts && normalized.retryable) {
+        await safeIncrementCounter(env.DB, "nebula_logical_retries");
+        await waitForLogicalRetry();
+        continue;
+      }
+      if (logicalAttempt > 1) await safeIncrementCounter(env.DB, "nebula_logical_retry_failures");
+      if (normalized.telemetry) {
+        console.warn(JSON.stringify({
+          event: "nebula_request_failed",
+          stage,
+          error: normalized.message.slice(0, 240),
+          ...normalized.telemetry
+        }));
+      }
+      throw normalized;
+    } finally {
+      clearTimeout(timeoutId);
+    }
+  }
+  throw new NebulaError("nebula_logical_retry_exhausted");
+}
+
+function readNebulaTelemetry(response: Response, requestedModel: string, startedAt: number, logicalAttempt: number): NebulaTelemetry {
+  const routedVia = response.headers.get("x-routed-via");
+  const route = parseRoutedVia(routedVia);
+  return {
+    requestedModel,
+    provider: route.provider,
+    routedModel: route.model,
+    fallbackAttempts: parseNonNegativeInteger(response.headers.get("x-fallback-attempts")),
+    requestId: response.headers.get("x-request-id"),
+    status: response.status,
+    latencyMs: Date.now() - startedAt,
+    logicalAttempt,
+    logicalRetry: logicalAttempt > 1,
+    attemptStatuses: []
+  };
+}
+
+function isTransientGatewayStatus(status: number): boolean {
+  return status === 502 || status === 503 || status === 504;
+}
+
+function isTransientTransportError(_error: unknown): boolean {
+  return true;
+}
+
+async function waitForLogicalRetry(): Promise<void> {
+  await new Promise<void>((resolve) => setTimeout(resolve, 250));
+}
+
+export function parseRoutedVia(value: string | null): { provider: string | null; model: string | null } {
+  const route = value?.trim();
+  if (!route) return { provider: null, model: null };
+  const slash = route.indexOf("/");
+  if (slash < 0) return { provider: route, model: null };
+  return {
+    provider: route.slice(0, slash) || null,
+    model: route.slice(slash + 1) || null
+  };
+}
+
+function parseNonNegativeInteger(value: string | null): number {
+  const parsed = Number(value);
+  return Number.isInteger(parsed) && parsed >= 0 ? parsed : 0;
+}
+
+export async function generateStructuredText(env: Env, prompt: string, stage: "stage1" | "stage2"): Promise<JsonObject | null> {
+  const systemPrompt = "You are a strict Persian-language news editor. Return exactly one valid JSON object. Keep all facts inside the supplied evidence, write title and description in Persian script, and never invent confirmation counts or identifiers.";
   try {
-    const result = await env.AI.run(config.textModel, {
-      messages: [
-        { role: "system", content: "You are a Persian-language news editor. Return one valid JSON object only. The title and description must always be written in Persian script. Translate English evidence into Persian; never copy an English sentence. Do not use Markdown fences. Do not invent facts." },
-        { role: "user", content: prompt.slice(0, 8_000) }
-      ],
-      response_format: { type: "json_object" },
-      temperature: 0.1,
-      max_tokens: 600
-    });
-    return parseStructuredAiResult(result);
+    const result = await generateNebulaJson(env, stage, systemPrompt, prompt.slice(0, 12_000), nebulaJsonSchema, 900);
+    return result?.data ?? null;
   } catch (error) {
-    console.error(JSON.stringify({ event: "ai_structured_text_failed", stage, error: error instanceof Error ? error.message : "unknown" }));
+    console.error(JSON.stringify({ event: "nebula_structured_text_failed", stage, error: error instanceof Error ? error.message : "unknown" }));
     return null;
   }
 }
 
 export async function generateImage(env: Env, prompt: string): Promise<GeneratedImage | null> {
   const config = runtimeConfig(env);
-  const allowed = await reserveAiCall(env.DB, "cover", config.maxCoversPerDay, 500, config.aiDailyNeuronBudget);
+  const allowed = await reserveWorkersAiCall(env.DB, "cover", config.maxCoversPerDay, 500, config.aiDailyNeuronBudget);
   if (!allowed) {
     console.info(JSON.stringify({ event: "ai_image_skipped", reason: "daily_budget_exhausted", model: config.imageModel }));
     return null;
@@ -90,19 +331,28 @@ export function parseStructuredAiResult(value: unknown): JsonObject | null {
   if (!isJsonObject(value)) return null;
 
   if (isJsonObject(value.response)) return value.response;
-  if (isJsonObject(value.result)) return value.result;
-  if (isJsonObject(value.result) && isJsonObject(value.result.response)) return value.result.response;
+  if (isJsonObject(value.result)) {
+    if (isJsonObject(value.result.response)) return value.result.response;
+    return value.result;
+  }
+
+  const choices = Array.isArray(value.choices) ? value.choices : [];
+  const firstChoice = choices[0];
+  if (isJsonObject(firstChoice) && isJsonObject(firstChoice.message)) {
+    const content = firstChoice.message.content;
+    if (isJsonObject(content)) return content;
+    if (typeof content === "string") return parseJsonText(content);
+    if (Array.isArray(content)) {
+      const text = content
+        .filter(isJsonObject)
+        .map((part) => typeof part.text === "string" ? part.text : "")
+        .join("");
+      if (text) return parseJsonText(text);
+    }
+  }
 
   const text = extractText(value);
-  if (!text) return null;
-  const cleaned = stripMarkdownFence(text).trim();
-  const direct = tryParseJson(cleaned);
-  if (direct) return direct;
-
-  const firstBrace = cleaned.indexOf("{");
-  const lastBrace = cleaned.lastIndexOf("}");
-  if (firstBrace >= 0 && lastBrace > firstBrace) return tryParseJson(cleaned.slice(firstBrace, lastBrace + 1));
-  return null;
+  return text ? parseJsonText(text) : null;
 }
 
 function extractText(value: JsonObject): string | null {
@@ -112,16 +362,20 @@ function extractText(value: JsonObject): string | null {
   return null;
 }
 
-function stripMarkdownFence(value: string): string {
-  return value
-    .replace(/^\s*```(?:json)?\s*/iu, "")
-    .replace(/\s*```\s*$/u, "");
-}
-
-function tryParseJson(value: string): JsonObject | null {
+function parseJsonText(value: string): JsonObject | null {
+  const cleaned = value.replace(/^\s*```(?:json)?\s*/iu, "").replace(/\s*```\s*$/u, "").trim();
   try {
-    const parsed: unknown = JSON.parse(value);
-    return isJsonObject(parsed) ? parsed : null;
+    const direct: unknown = JSON.parse(cleaned);
+    if (isJsonObject(direct)) return direct;
+  } catch {
+    // Fall through to the bounded object extraction for accidental prose.
+  }
+  const firstBrace = cleaned.indexOf("{");
+  const lastBrace = cleaned.lastIndexOf("}");
+  if (firstBrace < 0 || lastBrace <= firstBrace) return null;
+  try {
+    const extracted: unknown = JSON.parse(cleaned.slice(firstBrace, lastBrace + 1));
+    return isJsonObject(extracted) ? extracted : null;
   } catch {
     return null;
   }
@@ -131,16 +385,24 @@ function isJsonObject(value: unknown): value is JsonObject {
   return typeof value === "object" && value !== null && !Array.isArray(value);
 }
 
-function isNumberArray(value: unknown): value is number[] {
-  return Array.isArray(value) && value.every((item) => typeof item === "number");
-}
-
-function isEmbeddingResult(value: unknown): value is { data: number[][] } {
-  return isJsonObject(value) && Array.isArray(value.data) && value.data.every((row) => isNumberArray(row));
-}
-
 function isReadableStream(value: unknown): value is ReadableStream<Uint8Array> {
   return typeof value === "object" && value !== null && "getReader" in value && typeof value.getReader === "function";
+}
+
+function getString(value: unknown): string | null {
+  return typeof value === "string" && value.length > 0 ? value : null;
+}
+
+function getNumber(value: unknown): number {
+  return typeof value === "number" && Number.isFinite(value) ? value : 0;
+}
+
+async function safeIncrementCounter(db: D1Database, metric: string): Promise<void> {
+  try {
+    await incrementCounter(db, metric);
+  } catch (error) {
+    console.warn(JSON.stringify({ event: "counter_increment_skipped", metric, error: error instanceof Error ? error.message : "unknown" }));
+  }
 }
 
 function decodeBase64Image(value: string): GeneratedImage | null {
