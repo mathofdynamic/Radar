@@ -45,34 +45,70 @@ export type CurrentWindowValidationCode =
   | "current_window_duplicate_post_assignment"
   | "current_window_missing_post_assignment";
 
+export type CurrentWindowContractFailureClass =
+  | "CURRENT_WINDOW_UNKNOWN_POST_ID"
+  | "CURRENT_WINDOW_MISSING_POST_ASSIGNMENT"
+  | "CURRENT_WINDOW_DUPLICATE_POST_ASSIGNMENT"
+  | "CURRENT_WINDOW_INVALID_CLUSTER_SHAPE"
+  | "CURRENT_WINDOW_SCHEMA_FAILURE"
+  | "CURRENT_WINDOW_OTHER_CONTRACT_FAILURE";
+
 export class CurrentWindowValidationError extends Error {
   readonly code: CurrentWindowValidationCode;
+  readonly failureClass: CurrentWindowContractFailureClass;
+  readonly offendingPostIds: number[];
 
-  constructor(code: CurrentWindowValidationCode, detail: string) {
+  constructor(
+    code: CurrentWindowValidationCode,
+    detail: string,
+    options: {
+      failureClass?: CurrentWindowContractFailureClass;
+      offendingPostIds?: readonly number[];
+    } = {}
+  ) {
     super(`${code}:${detail}`);
     this.name = "CurrentWindowValidationError";
     this.code = code;
+    this.failureClass = options.failureClass ?? contractFailureClassForCode(code);
+    this.offendingPostIds = [...new Set(options.offendingPostIds ?? [])]
+      .filter((postId) => Number.isSafeInteger(postId) && postId > 0)
+      .sort((left, right) => left - right);
   }
 }
 
 export function validateCurrentWindowProposal(value: unknown, expectedPostIds: readonly number[]): CurrentWindowProposal {
   const parsed = currentWindowProposalOutputSchema.safeParse(value);
   if (!parsed.success) {
-    throw new CurrentWindowValidationError("current_window_proposal_invalid", parsed.error.issues[0]?.message ?? "schema");
+    const issue = parsed.error.issues[0];
+    throw new CurrentWindowValidationError("current_window_proposal_invalid", issue?.message ?? "schema", {
+      failureClass: schemaFailureClass(issue?.path ?? [])
+    });
   }
 
   const expected = new Set(expectedPostIds);
   const assigned = new Set<number>();
   for (const cluster of parsed.data.clusters) {
     for (const postId of cluster.post_ids) {
-      if (!expected.has(postId)) throw new CurrentWindowValidationError("current_window_unknown_post_id", String(postId));
-      if (assigned.has(postId)) throw new CurrentWindowValidationError("current_window_duplicate_post_assignment", String(postId));
+      if (!expected.has(postId)) {
+        throw new CurrentWindowValidationError("current_window_unknown_post_id", String(postId), {
+          offendingPostIds: [postId]
+        });
+      }
+      if (assigned.has(postId)) {
+        throw new CurrentWindowValidationError("current_window_duplicate_post_assignment", String(postId), {
+          offendingPostIds: [postId]
+        });
+      }
       assigned.add(postId);
     }
   }
 
   const missing = expectedPostIds.filter((postId) => !assigned.has(postId));
-  if (missing.length > 0) throw new CurrentWindowValidationError("current_window_missing_post_assignment", missing.join(","));
+  if (missing.length > 0) {
+    throw new CurrentWindowValidationError("current_window_missing_post_assignment", missing.join(","), {
+      offendingPostIds: missing
+    });
+  }
 
   return {
     clusters: parsed.data.clusters.map((cluster) => ({
@@ -90,6 +126,16 @@ export function validateCurrentWindowPair(value: unknown): CurrentWindowPair {
 
 export function acceptsCurrentWindowPair(pair: CurrentWindowPair | null): boolean {
   return pair?.relationship === "SAME_EVENT" && pair.confidence >= CURRENT_WINDOW_PAIR_ACCEPTANCE_CONFIDENCE;
+}
+
+export function buildFailClosedSingletonProposal(expectedPostIds: readonly number[]): CurrentWindowProposal {
+  return {
+    clusters: expectedPostIds.map((postId) => ({
+      post_ids: [postId],
+      classification: "UNCERTAIN" as const,
+      confidence: 0
+    }))
+  };
 }
 
 export function reconstructCurrentWindowClusters(
@@ -196,4 +242,25 @@ export const currentWindowPairJsonSchema: Record<string, unknown> = {
 
 function uniquePositiveIds(values: readonly number[]): number[] {
   return [...new Set(values)].filter((value) => Number.isSafeInteger(value) && value > 0).sort((left, right) => left - right);
+}
+
+function contractFailureClassForCode(code: CurrentWindowValidationCode): CurrentWindowContractFailureClass {
+  switch (code) {
+    case "current_window_unknown_post_id":
+      return "CURRENT_WINDOW_UNKNOWN_POST_ID";
+    case "current_window_missing_post_assignment":
+      return "CURRENT_WINDOW_MISSING_POST_ASSIGNMENT";
+    case "current_window_duplicate_post_assignment":
+      return "CURRENT_WINDOW_DUPLICATE_POST_ASSIGNMENT";
+    case "current_window_proposal_invalid":
+      return "CURRENT_WINDOW_SCHEMA_FAILURE";
+    default:
+      return "CURRENT_WINDOW_OTHER_CONTRACT_FAILURE";
+  }
+}
+
+function schemaFailureClass(path: readonly (string | number)[]): CurrentWindowContractFailureClass {
+  return path[0] === "clusters"
+    ? "CURRENT_WINDOW_INVALID_CLUSTER_SHAPE"
+    : "CURRENT_WINDOW_SCHEMA_FAILURE";
 }

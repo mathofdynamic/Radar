@@ -16,6 +16,7 @@ import { ANALYSIS_STALE_AFTER_MS, floorFiveMinuteWindow, normalizeLegacyAnalysis
 import { validateIntelligenceDecisions } from "./decision";
 import {
   acceptsCurrentWindowPair,
+  buildFailClosedSingletonProposal,
   currentWindowPairJsonSchema,
   currentWindowPairOutputSchema,
   currentWindowProposalJsonSchema,
@@ -23,6 +24,7 @@ import {
   reconstructCurrentWindowClusters,
   validateCurrentWindowPair,
   validateCurrentWindowProposal,
+  type CurrentWindowContractFailureClass,
   CurrentWindowValidationError,
   type CurrentWindowPair,
   type CurrentWindowPairCheck,
@@ -72,11 +74,22 @@ interface BatchApplyResult {
   uncertain: number;
 }
 
-interface CurrentProposalRequestResult extends NebulaJsonResult<CurrentWindowProposal> {}
+export interface CurrentWindowProposalRequestResult extends NebulaJsonResult<CurrentWindowProposal> {}
 
 interface CurrentPairRequestResult extends NebulaJsonResult<CurrentWindowPair> {}
 
+export type CurrentWindowProcessingMode = "AI_CLUSTERING" | "FAIL_CLOSED_SINGLETON_FALLBACK";
+
+export interface CurrentWindowProposalDiagnostic {
+  failure_class: CurrentWindowContractFailureClass;
+  offending_post_ids: number[];
+  detail: string;
+  parsed_proposal: string | null;
+}
+
 export interface CurrentWindowTelemetry {
+  batch_id: number | null;
+  batch_attempt: number | null;
   reports_considered: number;
   reports_sent_to_proposal: number;
   proposal_clusters: number;
@@ -109,6 +122,15 @@ export interface CurrentWindowTelemetry {
   retry_recoveries: number;
   contract_failures: number;
   model_failures: number;
+  processing_mode: CurrentWindowProcessingMode;
+  contract_failure_class: CurrentWindowContractFailureClass | null;
+  contract_failure_post_ids: number[];
+  contract_failure_detail: string | null;
+  recovery_attempted: boolean;
+  correction_attempts: number;
+  correction_recovered: boolean;
+  fallback_reason: string | null;
+  invalid_proposal_diagnostics: CurrentWindowProposalDiagnostic[];
   historical_semantic_links_attempted: 0;
 }
 
@@ -117,6 +139,11 @@ export interface CurrentWindowShadowResult {
   pairChecks: CurrentWindowPairCheck[];
   finalClusters: ReconstructedCurrentWindowCluster[];
   telemetry: CurrentWindowTelemetry;
+}
+
+export interface CurrentWindowProposalResolution {
+  proposal: CurrentWindowProposal;
+  usedSingletonFallback: boolean;
 }
 
 const CURRENT_WINDOW_PROPOSAL_SYSTEM_PROMPT = `You are Radar's current-window event clustering layer.
@@ -267,13 +294,15 @@ export async function recoverStaleIntelligence(env: Env): Promise<boolean> {
 
 export async function processIntelligenceBatch(env: Env, job: IntelligenceBatchJob): Promise<void> {
   const batch = await getBatch(env.DB, job.batchId);
-  if (!batch || batch.status === "completed") return;
+  if (!batch || isTerminalIntelligenceBatchStatus(batch.status)) return;
   const claimed = await claimBatch(env.DB, batch.id);
   if (!claimed) return;
 
   const config = runtimeConfig(env);
   const reports = await claimBatchReports(env.DB, batch.id, config);
   const telemetry = createCurrentWindowTelemetry(reports.length);
+  telemetry.batch_id = batch.id;
+  telemetry.batch_attempt = batch.attempts + 1;
   if (reports.length === 0) {
     await completeBatch(env.DB, batch.id, summarizeCurrentWindowTelemetry(telemetry), 0, 0);
     await enqueueIntelligenceBatch(env, new Date().toISOString(), true);
@@ -313,6 +342,10 @@ export async function processIntelligenceBatch(env: Env, job: IntelligenceBatchJ
   await enqueueIntelligenceBatch(env, new Date().toISOString(), true);
 }
 
+export function isTerminalIntelligenceBatchStatus(status: IntelligenceBatchRow["status"]): boolean {
+  return status === "completed" || status === "failed";
+}
+
 export async function runCurrentWindowShadow(
   env: Env,
   reports: readonly CurrentWindowReportInput[],
@@ -325,24 +358,20 @@ export async function runCurrentWindowShadow(
     throw new NebulaError(error instanceof Error ? error.message : "v8_current_window_configuration_invalid");
   }
 
-  let proposalResult: CurrentProposalRequestResult | null;
-  try {
-    proposalResult = await requestCurrentWindowProposal(env, reports);
-    if (!proposalResult) throw new NebulaError("v8_current_window_proposal_unavailable");
-    recordNebulaUsage(telemetry, proposalResult.usage, false);
-    telemetry.proposal_latency_ms += proposalResult.usage.latencyMs;
-    proposalResult = { ...proposalResult, data: validateCurrentWindowProposal(proposalResult.data, reports.map((report) => report.id)) };
-  } catch (error) {
-    recordNebulaFailureTelemetry(telemetry, error, false);
-    if (error instanceof NebulaError && error.message === "nebula_daily_budget_exhausted") telemetry.budget_failures += 1;
-    throw error;
-  }
-  if (!proposalResult) throw new NebulaError("v8_current_window_proposal_unavailable");
-  telemetry.proposal_clusters = proposalResult.data.clusters.length;
-  telemetry.proposal_singletons = proposalResult.data.clusters.filter((cluster) => cluster.post_ids.length === 1).length;
+  const proposalResolution = await resolveCurrentWindowProposal(
+    reports.map((report) => report.id),
+    telemetry,
+    () => requestCurrentWindowProposal(env, reports),
+    (invalidProposal, validationError) => requestCurrentWindowProposalCorrection(env, reports, invalidProposal, validationError)
+  );
+  const proposal = proposalResolution.proposal;
+  telemetry.proposal_clusters = proposalResolution.usedSingletonFallback ? 0 : proposal.clusters.length;
+  telemetry.proposal_singletons = proposalResolution.usedSingletonFallback
+    ? 0
+    : proposal.clusters.filter((cluster) => cluster.post_ids.length === 1).length;
 
   const pairWork: Array<{ leftPostId: number; rightPostId: number }> = [];
-  for (const cluster of proposalResult.data.clusters) {
+  for (const cluster of proposal.clusters) {
     if (cluster.classification !== "EVENT" || cluster.post_ids.length < 2) continue;
     for (const [leftPostId, rightPostId] of allPairs(cluster.post_ids)) {
       pairWork.push({ leftPostId, rightPostId });
@@ -379,13 +408,74 @@ export async function runCurrentWindowShadow(
     else telemetry.rejected_edges += 1;
   }
 
-  const finalClusters = reconstructCurrentWindowClusters(proposalResult.data, pairChecks);
+  const finalClusters = reconstructCurrentWindowClusters(proposal, pairChecks);
   telemetry.final_multi_report_clusters = finalClusters.filter((cluster) => cluster.postIds.length > 1).length;
   telemetry.final_singletons = finalClusters.filter((cluster) => cluster.postIds.length === 1).length;
-  return { proposal: proposalResult.data, pairChecks, finalClusters, telemetry };
+  return { proposal, pairChecks, finalClusters, telemetry };
 }
 
-async function requestCurrentWindowProposal(env: Env, reports: readonly CurrentWindowReportInput[]): Promise<CurrentProposalRequestResult | null> {
+export async function resolveCurrentWindowProposal(
+  expectedPostIds: readonly number[],
+  telemetry: CurrentWindowTelemetry,
+  requestProposal: () => Promise<CurrentWindowProposalRequestResult | null>,
+  requestCorrection: (
+    invalidProposal: CurrentWindowProposal,
+    validationError: CurrentWindowValidationError
+  ) => Promise<CurrentWindowProposalRequestResult | null>
+): Promise<CurrentWindowProposalResolution> {
+  let initialResult: CurrentWindowProposalRequestResult | null;
+  try {
+    initialResult = await requestProposal();
+    if (!initialResult) throw new NebulaError("v8_current_window_proposal_unavailable");
+    recordNebulaUsage(telemetry, initialResult.usage, false);
+    telemetry.proposal_latency_ms += initialResult.usage.latencyMs;
+  } catch (error) {
+    recordNebulaFailureTelemetry(telemetry, error, false);
+    if (isCurrentWindowProposalContractFailure(error)) {
+      recordCurrentWindowContractFailure(telemetry, error, null);
+      return singletonFallback(expectedPostIds, telemetry, error instanceof Error ? error.message : "proposal_contract_failure");
+    }
+    if (error instanceof NebulaError && error.message === "nebula_daily_budget_exhausted") telemetry.budget_failures += 1;
+    throw error;
+  }
+
+  if (!initialResult) throw new NebulaError("v8_current_window_proposal_unavailable");
+
+  try {
+    return {
+      proposal: validateCurrentWindowProposal(initialResult.data, expectedPostIds),
+      usedSingletonFallback: false
+    };
+  } catch (error) {
+    if (!(error instanceof CurrentWindowValidationError)) throw error;
+
+    recordCurrentWindowContractFailure(telemetry, error, initialResult.data);
+    telemetry.recovery_attempted = true;
+    telemetry.correction_attempts += 1;
+
+    let correctionResult: CurrentWindowProposalRequestResult | null = null;
+    try {
+      correctionResult = await requestCorrection(initialResult.data, error);
+      if (!correctionResult) throw new NebulaError("v8_current_window_correction_unavailable");
+      recordNebulaUsage(telemetry, correctionResult.usage, false);
+      telemetry.proposal_latency_ms += correctionResult.usage.latencyMs;
+      const correctedProposal = validateCurrentWindowProposal(correctionResult.data, expectedPostIds);
+      telemetry.correction_recovered = true;
+      return { proposal: correctedProposal, usedSingletonFallback: false };
+    } catch (correctionError) {
+      if (correctionError instanceof CurrentWindowValidationError || isCurrentWindowProposalContractFailure(correctionError)) {
+        recordCurrentWindowContractFailure(telemetry, correctionError, correctionResult?.data ?? null);
+      } else {
+        recordNebulaFailureTelemetry(telemetry, correctionError, false);
+        if (correctionError instanceof NebulaError && correctionError.message === "nebula_daily_budget_exhausted") telemetry.budget_failures += 1;
+        if (!(correctionError instanceof NebulaError) || correctionError.message !== "historical_semantic_linking_unsupported") telemetry.model_failures += 1;
+      }
+      return singletonFallback(expectedPostIds, telemetry, correctionError instanceof Error ? correctionError.message : "correction_failed");
+    }
+  }
+}
+
+async function requestCurrentWindowProposal(env: Env, reports: readonly CurrentWindowReportInput[]): Promise<CurrentWindowProposalRequestResult | null> {
   const config = runtimeConfig(env);
   const reportPayload = reports.map((report) => ({
     post_id: report.id,
@@ -424,6 +514,53 @@ async function requestCurrentWindowProposal(env: Env, reports: readonly CurrentW
     }
   );
   return result;
+}
+
+async function requestCurrentWindowProposalCorrection(
+  env: Env,
+  reports: readonly CurrentWindowReportInput[],
+  invalidProposal: CurrentWindowProposal,
+  validationError: CurrentWindowValidationError
+): Promise<CurrentWindowProposalRequestResult | null> {
+  const config = runtimeConfig(env);
+  const allowedPostIds = reports.map((report) => report.id);
+  const prompt = JSON.stringify({
+    task: "Correct only the invalid current-window partition.",
+    input_post_ids: allowedPostIds,
+    invalid_partition: invalidProposal,
+    validator_error: {
+      failure_class: validationError.failureClass,
+      detail: validationError.message,
+      offending_post_ids: validationError.offendingPostIds
+    },
+    rules: [
+      "Return only a corrected partition.",
+      "Every supplied post_id must occur exactly once.",
+      "Do not invent, omit, or duplicate post_ids.",
+      "Do not change report contents or add facts.",
+      "No historical events or historical IDs are allowed."
+    ],
+    output_schema: { clusters: "[{post_ids, classification, confidence}]" }
+  });
+  const systemPrompt = `You are Radar's strict current-window partition correction layer.
+The previous partition was rejected by a deterministic validator.
+Repair the partition contract only. Do not reinterpret the reports or add semantic merges.
+Every supplied post_id must occur exactly once. Return JSON only.`;
+  if (prompt.length + systemPrompt.length > config.intelligenceMaxPayloadChars) throw new NebulaError("v8_current_window_correction_payload_too_large");
+  return generateNebulaJson(
+    env,
+    "intelligence_proposal",
+    systemPrompt,
+    prompt,
+    currentWindowProposalOutputSchema,
+    2_000,
+    {
+      responseSchema: currentWindowProposalJsonSchema(allowedPostIds),
+      responseSchemaName: "radar_current_window_clusters_correction",
+      chatTemplateKwargs: CURRENT_WINDOW_CHAT_TEMPLATE_KWARGS,
+      completionParameter: "max_completion_tokens"
+    }
+  );
 }
 
 async function requestCurrentWindowPair(
@@ -555,8 +692,10 @@ function buildCurrentWindowDecisions(clusters: readonly ReconstructedCurrentWind
   });
 }
 
-function createCurrentWindowTelemetry(reportsConsidered: number): CurrentWindowTelemetry {
+export function createCurrentWindowTelemetry(reportsConsidered: number): CurrentWindowTelemetry {
   return {
+    batch_id: null,
+    batch_attempt: null,
     reports_considered: reportsConsidered,
     reports_sent_to_proposal: reportsConsidered,
     proposal_clusters: 0,
@@ -589,8 +728,70 @@ function createCurrentWindowTelemetry(reportsConsidered: number): CurrentWindowT
     retry_recoveries: 0,
     contract_failures: 0,
     model_failures: 0,
+    processing_mode: "AI_CLUSTERING",
+    contract_failure_class: null,
+    contract_failure_post_ids: [],
+    contract_failure_detail: null,
+    recovery_attempted: false,
+    correction_attempts: 0,
+    correction_recovered: false,
+    fallback_reason: null,
+    invalid_proposal_diagnostics: [],
     historical_semantic_links_attempted: 0
   };
+}
+
+function singletonFallback(
+  expectedPostIds: readonly number[],
+  telemetry: CurrentWindowTelemetry,
+  reason: string
+): CurrentWindowProposalResolution {
+  telemetry.processing_mode = "FAIL_CLOSED_SINGLETON_FALLBACK";
+  telemetry.fallback_reason = reason.slice(0, 240);
+  telemetry.final_multi_report_clusters = 0;
+  telemetry.final_singletons = expectedPostIds.length;
+  return {
+    proposal: buildFailClosedSingletonProposal(expectedPostIds),
+    usedSingletonFallback: true
+  };
+}
+
+function isCurrentWindowProposalContractFailure(error: unknown): boolean {
+  return error instanceof CurrentWindowValidationError
+    || (error instanceof NebulaError && (error.message.includes("schema") || error.message.includes("response_not_json")));
+}
+
+function recordCurrentWindowContractFailure(
+  telemetry: CurrentWindowTelemetry,
+  error: unknown,
+  proposal: CurrentWindowProposal | null
+): void {
+  telemetry.contract_failures += 1;
+  const failureClass: CurrentWindowContractFailureClass = error instanceof CurrentWindowValidationError
+    ? error.failureClass
+    : "CURRENT_WINDOW_SCHEMA_FAILURE";
+  const offendingPostIds = error instanceof CurrentWindowValidationError ? error.offendingPostIds : [];
+  const detail = error instanceof Error ? error.message.slice(0, 500) : "current_window_contract_failure";
+  if (!telemetry.contract_failure_class) telemetry.contract_failure_class = failureClass;
+  telemetry.contract_failure_post_ids = [...new Set([...telemetry.contract_failure_post_ids, ...offendingPostIds])].sort((left, right) => left - right);
+  telemetry.contract_failure_detail ??= detail;
+  telemetry.invalid_proposal_diagnostics = [
+    ...telemetry.invalid_proposal_diagnostics,
+    {
+      failure_class: failureClass,
+      offending_post_ids: [...offendingPostIds],
+      detail,
+      parsed_proposal: proposal ? boundedProposal(proposal) : null
+    }
+  ].slice(-2);
+}
+
+function boundedProposal(proposal: CurrentWindowProposal): string | null {
+  try {
+    return JSON.stringify(proposal).slice(0, 4_000);
+  } catch {
+    return null;
+  }
 }
 
 function recordNebulaUsage(telemetry: CurrentWindowTelemetry, usage: NebulaUsage, isPairVerification: boolean): void {
@@ -632,6 +833,7 @@ function recordNebulaStatuses(telemetry: CurrentWindowTelemetry, statuses: reado
 function summarizeCurrentWindowTelemetry(telemetry: CurrentWindowTelemetry): string {
   return JSON.stringify({
     v8_current_window: telemetry,
+    diagnostic_captured_at: new Date().toISOString(),
     model: V8_CURRENT_WINDOW_MODEL,
     thinking: "disabled",
     historical_semantic_linking: "disabled"
