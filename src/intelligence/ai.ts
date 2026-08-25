@@ -72,6 +72,28 @@ export interface NebulaRequestOptions {
   responseSchemaName?: string;
   chatTemplateKwargs?: Record<string, unknown>;
   completionParameter?: "max_tokens" | "max_completion_tokens";
+  pairReservation?: NebulaPairReservationContext;
+}
+
+export interface NebulaPairReservationEvent {
+  batch_id: number | null;
+  stage: "intelligence_pair";
+  logical_pair_check_id: string;
+  left_post_id: number;
+  right_post_id: number;
+  physical_attempt: number;
+  reservation: "RESERVED" | "BUDGET_BLOCKED";
+  usage_date: string;
+  retry: boolean;
+  timestamp: string;
+}
+
+export interface NebulaPairReservationContext {
+  batch_id: number | null;
+  logical_pair_check_id: string;
+  left_post_id: number;
+  right_post_id: number;
+  onReservation: (event: NebulaPairReservationEvent) => void;
 }
 
 const nebulaJsonSchema = z.record(z.unknown());
@@ -107,6 +129,24 @@ export async function generateNebulaJson<T>(
   const attemptStatuses: Array<number | null> = [];
   for (let logicalAttempt = 1; logicalAttempt <= maxLogicalAttempts; logicalAttempt += 1) {
     const reserved = await reserveNebulaCall(env.DB, stage, maxCalls);
+    if (stage === "intelligence_pair" && options.pairReservation) {
+      try {
+        options.pairReservation.onReservation({
+          batch_id: options.pairReservation.batch_id,
+          stage,
+          logical_pair_check_id: options.pairReservation.logical_pair_check_id,
+          left_post_id: options.pairReservation.left_post_id,
+          right_post_id: options.pairReservation.right_post_id,
+          physical_attempt: logicalAttempt,
+          reservation: reserved ? "RESERVED" : "BUDGET_BLOCKED",
+          usage_date: new Date().toISOString().slice(0, 10),
+          retry: logicalAttempt > 1,
+          timestamp: new Date().toISOString()
+        });
+      } catch (error) {
+        console.warn(JSON.stringify({ event: "pair_reservation_telemetry_skipped", error: error instanceof Error ? error.message : "unknown" }));
+      }
+    }
     if (!reserved) {
       if (logicalAttempt > 1) await safeIncrementCounter(env.DB, "nebula_logical_retry_failures");
       throw new NebulaError("nebula_daily_budget_exhausted");

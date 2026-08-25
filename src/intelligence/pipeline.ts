@@ -4,6 +4,7 @@ import {
   claimIntelligenceReport,
   getEvent,
   getEventByOriginatingRawPostId,
+  getNebulaStageUsage,
   getSource,
   incrementCounter,
   markRawPostAnalyzed,
@@ -11,7 +12,7 @@ import {
 } from "../db";
 import { normalizePersianText, lexicalOverlap } from "../normalization";
 import type { EditorialBatchJob, IntelligenceBatchJob } from "../queue";
-import { generateNebulaJson, NebulaError, type NebulaJsonResult, type NebulaUsage } from "./ai";
+import { generateNebulaJson, NebulaError, type NebulaJsonResult, type NebulaPairReservationEvent, type NebulaUsage } from "./ai";
 import { ANALYSIS_STALE_AFTER_MS, floorFiveMinuteWindow, normalizeLegacyAnalysisStatus } from "./analysis-state";
 import { validateIntelligenceDecisions } from "./decision";
 import {
@@ -87,6 +88,10 @@ export interface CurrentWindowProposalDiagnostic {
   parsed_proposal: string | null;
 }
 
+const PAIR_RESERVATION_TELEMETRY_MAX_ENTRIES = 2_048;
+const PAIR_BUDGET_USAGE_HIGH = 1_100;
+const PAIR_BUDGET_USAGE_CRITICAL = 1_250;
+
 export interface CurrentWindowTelemetry {
   batch_id: number | null;
   batch_attempt: number | null;
@@ -100,6 +105,17 @@ export interface CurrentWindowTelemetry {
   pair_verification_failures: number;
   pair_budget_failures: number;
   budget_failures: number;
+  pair_logical_checks: number;
+  pair_reservation_attempts: number;
+  pair_reservation_successes: number;
+  pair_reservation_budget_blocked: number;
+  pair_physical_retries: number;
+  pair_reservation_telemetry: NebulaPairReservationEvent[];
+  pair_reservation_telemetry_truncated: number;
+  pair_budget_usage_date: string | null;
+  pair_budget_usage_after_batch: number | null;
+  pair_budget_usage_signal: "HIGH" | "CRITICAL" | null;
+  pair_capacity_counters_recorded: boolean;
   raw_same_event_edges: number;
   accepted_same_event_edges: number;
   hard_contradiction_vetoes: number;
@@ -314,6 +330,7 @@ export async function processIntelligenceBatch(env: Env, job: IntelligenceBatchJ
   try {
     const allReportIds = reports.map((report) => report.id);
     const shadow = await runCurrentWindowShadow(env, reports, telemetry);
+    await recordPairCapacityTelemetry(env.DB, telemetry);
     const decisions = buildCurrentWindowDecisions(shadow.finalClusters, reports);
     const validatedDecisions = validateIntelligenceDecisions(
       { decisions },
@@ -335,6 +352,7 @@ export async function processIntelligenceBatch(env: Env, job: IntelligenceBatchJ
     if (error instanceof NebulaError && error.message === "historical_semantic_linking_unsupported") {
       console.error(JSON.stringify({ event: "v8_historical_semantic_linking_unsupported", historical_semantic_links_attempted: 0 }));
     }
+    await recordPairCapacityTelemetry(env.DB, telemetry);
     await persistCurrentWindowTelemetry(env.DB, batch.id, telemetry);
     await releaseBatchReports(env.DB, batch.id, error instanceof Error ? error.message : "intelligence_batch_failed");
     throw error;
@@ -370,18 +388,23 @@ export async function runCurrentWindowShadow(
     ? 0
     : proposal.clusters.filter((cluster) => cluster.post_ids.length === 1).length;
 
-  const pairWork: Array<{ leftPostId: number; rightPostId: number }> = [];
+  const pairWork: Array<{ leftPostId: number; rightPostId: number; logicalPairCheckId: string }> = [];
   for (const cluster of proposal.clusters) {
     if (cluster.classification !== "EVENT" || cluster.post_ids.length < 2) continue;
     for (const [leftPostId, rightPostId] of allPairs(cluster.post_ids)) {
-      pairWork.push({ leftPostId, rightPostId });
+      pairWork.push({
+        leftPostId,
+        rightPostId,
+        logicalPairCheckId: `batch:${telemetry.batch_id ?? "shadow"}:${leftPostId}:${rightPostId}`
+      });
     }
   }
 
   telemetry.pair_verification_calls += pairWork.length;
+  telemetry.pair_logical_checks += pairWork.length;
   const reportById = new Map(reports.map((report) => [report.id, report]));
-  const pairChecks = await mapWithConcurrency(pairWork, CURRENT_WINDOW_PAIR_CONCURRENCY, async ({ leftPostId, rightPostId }) => {
-    const pairResult = await requestCurrentWindowPair(env, reports, leftPostId, rightPostId, telemetry);
+  const pairChecks = await mapWithConcurrency(pairWork, CURRENT_WINDOW_PAIR_CONCURRENCY, async ({ leftPostId, rightPostId, logicalPairCheckId }) => {
+    const pairResult = await requestCurrentWindowPair(env, reports, leftPostId, rightPostId, logicalPairCheckId, telemetry);
     const modelPair = pairResult?.data ?? null;
     const modelAccepted = acceptsCurrentWindowPair(modelPair);
     if (modelAccepted) telemetry.raw_same_event_edges += 1;
@@ -568,6 +591,7 @@ async function requestCurrentWindowPair(
   reports: readonly CurrentWindowReportInput[],
   leftPostId: number,
   rightPostId: number,
+  logicalPairCheckId: string,
   telemetry: CurrentWindowTelemetry
 ): Promise<CurrentPairRequestResult | null> {
   const config = runtimeConfig(env);
@@ -609,7 +633,14 @@ async function requestCurrentWindowPair(
         responseSchema: currentWindowPairJsonSchema,
         responseSchemaName: "radar_current_window_pair",
         chatTemplateKwargs: CURRENT_WINDOW_CHAT_TEMPLATE_KWARGS,
-        completionParameter: "max_completion_tokens"
+        completionParameter: "max_completion_tokens",
+        pairReservation: {
+          batch_id: telemetry.batch_id,
+          logical_pair_check_id: logicalPairCheckId,
+          left_post_id: leftPostId,
+          right_post_id: rightPostId,
+          onReservation: (event) => recordPairReservationTelemetry(telemetry, event)
+        }
       }
     );
     if (!result) {
@@ -706,6 +737,17 @@ export function createCurrentWindowTelemetry(reportsConsidered: number): Current
     pair_verification_failures: 0,
     pair_budget_failures: 0,
     budget_failures: 0,
+    pair_logical_checks: 0,
+    pair_reservation_attempts: 0,
+    pair_reservation_successes: 0,
+    pair_reservation_budget_blocked: 0,
+    pair_physical_retries: 0,
+    pair_reservation_telemetry: [],
+    pair_reservation_telemetry_truncated: 0,
+    pair_budget_usage_date: null,
+    pair_budget_usage_after_batch: null,
+    pair_budget_usage_signal: null,
+    pair_capacity_counters_recorded: false,
     raw_same_event_edges: 0,
     accepted_same_event_edges: 0,
     hard_contradiction_vetoes: 0,
@@ -739,6 +781,55 @@ export function createCurrentWindowTelemetry(reportsConsidered: number): Current
     invalid_proposal_diagnostics: [],
     historical_semantic_links_attempted: 0
   };
+}
+
+export function recordPairReservationTelemetry(telemetry: CurrentWindowTelemetry, event: NebulaPairReservationEvent): void {
+  telemetry.pair_reservation_attempts += 1;
+  if (event.reservation === "RESERVED") telemetry.pair_reservation_successes += 1;
+  else telemetry.pair_reservation_budget_blocked += 1;
+  if (event.retry) telemetry.pair_physical_retries += 1;
+  if (telemetry.pair_reservation_telemetry.length < PAIR_RESERVATION_TELEMETRY_MAX_ENTRIES) {
+    telemetry.pair_reservation_telemetry.push({ ...event });
+  } else {
+    telemetry.pair_reservation_telemetry_truncated += 1;
+  }
+}
+
+export function pairBudgetUsageSignal(usage: number): "HIGH" | "CRITICAL" | null {
+  if (usage >= PAIR_BUDGET_USAGE_CRITICAL) return "CRITICAL";
+  if (usage >= PAIR_BUDGET_USAGE_HIGH) return "HIGH";
+  return null;
+}
+
+async function recordPairCapacityTelemetry(db: D1Database, telemetry: CurrentWindowTelemetry): Promise<void> {
+  if (telemetry.pair_capacity_counters_recorded) return;
+  telemetry.pair_capacity_counters_recorded = true;
+  if (telemetry.pair_logical_checks === 0 && telemetry.pair_reservation_attempts === 0) return;
+
+  const usageDate = new Date().toISOString().slice(0, 10);
+  telemetry.pair_budget_usage_date = usageDate;
+  try {
+    telemetry.pair_budget_usage_after_batch = await getNebulaStageUsage(db, "intelligence_pair", usageDate);
+  } catch (error) {
+    console.warn(JSON.stringify({ event: "pair_budget_usage_read_skipped", error: error instanceof Error ? error.message : "unknown" }));
+  }
+
+  await safeIncrementCounter(db, "pair_logical_checks", telemetry.pair_logical_checks);
+  await safeIncrementCounter(db, "pair_reservation_attempts", telemetry.pair_reservation_attempts);
+  await safeIncrementCounter(db, "pair_reservation_successes", telemetry.pair_reservation_successes);
+  await safeIncrementCounter(db, "pair_reservation_budget_blocked", telemetry.pair_reservation_budget_blocked);
+  await safeIncrementCounter(db, "pair_physical_retries", telemetry.pair_physical_retries);
+
+  const usage = telemetry.pair_budget_usage_after_batch;
+  const usageSignal = usage === null ? null : pairBudgetUsageSignal(usage);
+  if (usageSignal === "CRITICAL") {
+    telemetry.pair_budget_usage_signal = usageSignal;
+    await safeIncrementCounter(db, "pair_budget_usage_high");
+    await safeIncrementCounter(db, "pair_budget_usage_critical");
+  } else if (usageSignal === "HIGH") {
+    telemetry.pair_budget_usage_signal = usageSignal;
+    await safeIncrementCounter(db, "pair_budget_usage_high");
+  }
 }
 
 function singletonFallback(

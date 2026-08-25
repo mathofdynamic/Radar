@@ -246,6 +246,12 @@ export async function reserveNebulaCall(db: D1Database, stage: string, maxCalls:
   return Number(reservation.meta.changes ?? 0) > 0;
 }
 
+export async function getNebulaStageUsage(db: D1Database, stage: string, usageDate = new Date().toISOString().slice(0, 10)): Promise<number> {
+  const row = await db.prepare("SELECT calls FROM ai_usage WHERE usage_date = ? AND stage = ?")
+    .bind(usageDate, stage).first<{ calls: number }>();
+  return Math.max(0, Number(row?.calls ?? 0));
+}
+
 export async function countStoriesToday(db: D1Database): Promise<number> {
   const date = new Date().toISOString().slice(0, 10);
   const row = await db.prepare("SELECT COUNT(*) AS count FROM published_stories WHERE publication_state = 'published' AND substr(published_at, 1, 10) = ?")
