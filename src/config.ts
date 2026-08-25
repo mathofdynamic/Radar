@@ -68,7 +68,7 @@ export function runtimeConfig(env: Env): RuntimeConfig {
     intelligenceMaxReportChars: Math.max(400, Math.min(4_000, numberSetting(env.INTELLIGENCE_MAX_REPORT_CHARS, 1_800))),
     intelligenceAmbiguityThreshold: Math.max(0, Math.min(1, numberSetting(env.INTELLIGENCE_AMBIGUITY_THRESHOLD, 0.72))),
     maxIntelligenceBatchesPerDay: Math.max(1, numberSetting(env.MAX_INTELLIGENCE_BATCHES_PER_DAY, 500)),
-    maxIntelligenceSecondPassCallsPerDay: Math.max(0, numberSetting(env.MAX_INTELLIGENCE_SECOND_PASS_CALLS_PER_DAY, 800)),
+    maxIntelligenceSecondPassCallsPerDay: Math.max(0, numberSetting(env.MAX_INTELLIGENCE_SECOND_PASS_CALLS_PER_DAY, 1400)),
     imageModel: env.AI_IMAGE_MODEL,
     aiDailyNeuronBudget: numberSetting(env.AI_DAILY_NEURON_BUDGET, 8_000),
     maxStage1CallsPerDay: numberSetting(env.MAX_STAGE1_CALLS_PER_DAY, 250),
