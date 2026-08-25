@@ -1,0 +1,14 @@
+{
+  "batch_id": 221,
+  "post_id": 18022,
+  "input_post_ids": [18007, 18016, 18018, 18019, 18020, 18021, 18022, 18023],
+  "initial_proposal": {
+    "clusters": [
+      { "post_ids": [18007, 18016], "classification": "EVENT", "confidence": 0.91 },
+      { "post_ids": [18018, 18019], "classification": "EVENT", "confidence": 0.88 },
+      { "post_ids": [18020, 18021], "classification": "EVENT", "confidence": 0.86 },
+      { "post_ids": [18022], "classification": "EVENT", "confidence": 0.83 },
+      { "post_ids": [18022, 18023], "classification": "EVENT", "confidence": 0.82 }
+    ]
+  }
+}
